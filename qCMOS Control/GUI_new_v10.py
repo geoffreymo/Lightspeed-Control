@@ -27,6 +27,9 @@ from concurrent.futures import ThreadPoolExecutor
 import multiprocessing as mp
 from multiprocessing import Process, Queue as MPQueue
 import psutil
+import socket
+import re
+from collections import defaultdict
 
 # Load required library
 ctypes.CDLL("libudev.so.1", mode=ctypes.RTLD_GLOBAL)
@@ -240,7 +243,12 @@ class CameraThread(threading.Thread):
                 
                 if self.capturing and not self.stop_requested.is_set():
                     # Simple watchdog check
-                    if self.watchdog_enabled and time.time() - self.last_capture_time > 10.0:
+                    # Check if exposure time is longer than 1 minutes
+                    if self.gui_ref is not None and self.gui_ref.exposure_time_var.get() > 60000.0:
+                        if self.watchdog_enabled and time.time() - self.last_capture_time > 1801.0:
+                            logging.error("Capture watchdog triggered")
+                            self.reset_capture_state()
+                    elif self.watchdog_enabled and time.time() - self.last_capture_time > 61.0:
                         logging.error("Capture watchdog triggered")
                         self.reset_capture_state()
                     else:
@@ -361,13 +369,16 @@ class CameraThread(threading.Thread):
     def get_gps_timestamp(self):
         """Get GPS timestamp asynchronously"""
         try:
-            self.start_time = GPS_time.get_first_timestamp()
-            if self.start_time:
-                logging.info(f"GPS timestamp: {self.start_time.isot}")
-                self.update_gui_gps(self.start_time.isot)
-            else:
-                logging.warning("No GPS timestamp available")
-                self.update_gui_gps("No GPS timestamp")
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(GPS_time.get_first_timestamp)
+                self.start_time = future.result(timeout=1.0)
+                
+                if self.start_time:
+                    logging.info(f"GPS timestamp: {self.start_time.isot}")
+                    self.update_gui_gps(self.start_time.isot)
+                else:
+                    logging.warning("No GPS timestamp available")
+                    self.update_gui_gps("No GPS timestamp")
         except Exception as e:
             logging.error(f"GPS timestamp error: {e}")
             self.update_gui_gps("GPS timeout")
@@ -495,7 +506,7 @@ class CameraThread(threading.Thread):
         defaults = {
             'READOUT_SPEED': 1.0,
             'EXPOSURE_TIME': 0.1,
-            'TRIGGER_SOURCE': 2.0,
+            'TRIGGER_SOURCE': 1.0,
             'TRIGGER_MODE': 6.0,
             'OUTPUT_TRIG_KIND_0': 3.0,
             'OUTPUT_TRIG_ACTIVE_0': 1.0,
@@ -906,7 +917,7 @@ class PeripheralsThread(threading.Thread):
         threading.Timer(2.0, self.update_gui_with_current_positions).start()
 
         # Initialize focus motor sequence after a short delay
-        threading.Timer(3.0, self.initialize_focus_sequence).start()
+        # threading.Timer(3.0, self.initialize_focus_sequence).start()
 
     async def connect_pdu(self):
         """Connect to PDU"""
@@ -1056,7 +1067,7 @@ class PeripheralsThread(threading.Thread):
             with self.peripherals_lock:
                 if self.ljm_handle:
                     state = ljm.eReadName(self.ljm_handle, "DIO4")
-                    return 'Closed' if state else 'Open'
+                    return 'Open' if state == 0 else 'Closed'
         except Exception as e:
             debug_logger.error(f"Get shutter state error: {e}")
         return 'Open'
@@ -1171,46 +1182,45 @@ class PeripheralsThread(threading.Thread):
         # Run in executor to avoid blocking
         self.executor.submit(_focus_init)
 ###TBT
-    def set_zoom_reference(self, virtual_position):
-            """Set current physical position as reference for virtual coordinate system"""
+    def set_zoom_reference(self):
+            """Set current physical position as reference for a virtual position of zero"""
             try:
                 if self.ax_a_2 is None:
                     return False
                     
                 with self.peripherals_lock:
                     self.zoom_reference_position = self.ax_a_2.get_position(Units.ANGLE_DEGREES)
-                    self.zoom_virtual_position = virtual_position
+                    self.zoom_virtual_position = 0
                     self.zoom_reference_set = True
                     
-                logging.info(f"Zoom reference set: virtual={virtual_position}°, physical={self.zoom_reference_position:.1f}°")
+                logging.info(f"3x zoom-out reference set: physical={self.zoom_reference_position:.1f}°")
                 return True
             except Exception as e:
                 logging.error(f"Set zoom reference error: {e}")
                 return False
 
     def move_zoom_to_virtual(self, virtual_target):
-        """Move to virtual position (0-306°)"""
+        """Move to virtual position (0-300°)"""
         try:
             if self.ax_a_2 is None or not self.zoom_reference_set:
                 return False
-                
-            virtual_delta = virtual_target - self.zoom_virtual_position
-            physical_target = self.zoom_reference_position + virtual_delta
+            
+            physical_target = self.zoom_reference_position + virtual_target
+            print(self.zoom_virtual_position, virtual_target, self.zoom_reference_position, physical_target)
             
             with self.peripherals_lock:
                 self.ax_a_2.move_absolute(physical_target, Units.ANGLE_DEGREES)
                 self.zoom_virtual_position = virtual_target
                 
-            focal_length = self.virtual_to_focal_length(virtual_target)
-            logging.info(f"Zoom moved to virtual {virtual_target}° (~{focal_length}mm)")
+            logging.info(f"Zoom moved to virtual {virtual_target}°")
             return True
             
         except Exception as e:
             logging.error(f"Move zoom virtual error: {e}")
             return False
 
-    def move_zoom_relative_emergency(self, relative_degrees):
-        """Emergency relative zoom movement"""
+    def move_zoom_relative(self, relative_degrees):
+        """Relative zoom movement"""
         try:
             if self.ax_a_2 is None:
                 return False
@@ -1220,7 +1230,8 @@ class PeripheralsThread(threading.Thread):
                 new_position = current_pos + relative_degrees
                 self.ax_a_2.move_absolute(new_position, Units.ANGLE_DEGREES)
                 
-                # Update virtual position if reference is set
+                # If this pushes the virtual position out of bounds,
+                # update the reference
                 if self.zoom_reference_set:
                     self.zoom_virtual_position += relative_degrees
                     
@@ -1229,12 +1240,6 @@ class PeripheralsThread(threading.Thread):
             logging.error(f"Emergency zoom move error: {e}")
             return False
 
-    @staticmethod
-    def virtual_to_focal_length(virtual_pos):
-        """Convert virtual position to approximate focal length"""
-        # Linear interpolation: 0° = 100mm, 306° = 300mm
-        focal_length = 100 + (virtual_pos / 306.0) * 200
-        return int(focal_length)
 ###TBT###
     def disconnect_peripherals(self):
         """Disconnect all peripherals"""
@@ -1289,6 +1294,242 @@ class PeripheralsThread(threading.Thread):
                     logging.error(f"Get outlet states error: {e}")
         return {}
 
+#!/usr/bin/env python3
+"""
+Fixed TCSThread class that properly handles TCS communication
+The TCS closes connections after each command, so we need to reconnect for each operation
+"""
+
+class TCSThread(threading.Thread):
+    """Thread for communicating with the Telescope Control System"""
+    
+    def __init__(self, tcs_ip="200.28.147.59", tcs_port=5811, gui_ref=None):
+        super().__init__(name="TCSThread")
+        self.tcs_ip = tcs_ip
+        self.tcs_port = tcs_port
+        self.gui_ref = gui_ref
+        self.running = True
+        self.tcs_data = {
+            'ra': 'N/A',
+            'dec': 'N/A',
+            'equinox': 'N/A',
+            'rotator_angle': 'N/A',
+            'parallactic_angle': 'N/A',
+            'airmass': 'N/A',
+            'elevation': 'N/A',
+            'azimuth': 'N/A',
+            'hour_angle': 'N/A',
+            'sidereal_time': 'N/A',
+            'date': 'N/A',
+            'time': 'N/A'
+        }
+        self.data_lock = threading.RLock()
+        self.last_update = time.time()
+        self.command_lock = threading.Lock()  # Lock for command sending
+        
+    def run(self):
+        """Main thread loop"""
+        logging.info("TCS thread started")
+        while self.running:
+            try:
+                # Request data cyclically
+                self.request_tcs_data()
+                time.sleep(2)  # Update every 2 seconds
+                
+            except Exception as e:
+                logging.error(f"TCS thread error: {e}")
+                time.sleep(5)
+    
+    def send_single_command(self, command):
+        """Send a single command to TCS with fresh connection
+        
+        TCS closes connection after each command, so we need to reconnect each time
+        """
+        with self.command_lock:  # Ensure only one command at a time
+            socket_conn = None
+            try:
+                # Create new connection for this command
+                socket_conn = socket.create_connection((self.tcs_ip, self.tcs_port), timeout=5)
+                socket_conn.settimeout(2)
+                
+                # Send command
+                socket_conn.sendall(f"{command}\n".encode('ascii'))
+                
+                # Read response - TCS sends response then closes connection
+                response = b''
+                while True:
+                    try:
+                        data = socket_conn.recv(1024)
+                        if not data:
+                            break
+                        response += data
+                        if b'\n' in response:
+                            break
+                    except socket.timeout:
+                        break
+                
+                result = response.decode('ascii', errors='ignore').strip() if response else None
+                
+                return result
+                
+            except Exception as e:
+                logging.error(f"TCS command '{command}' error: {e}")
+                return None
+            finally:
+                # Always close the socket
+                if socket_conn:
+                    try:
+                        socket_conn.close()
+                    except:
+                        pass
+    
+    def request_tcs_data(self):
+        """Request and parse TCS data"""
+        try:
+            # Request datetime
+            datetime_response = self.send_single_command("datetime")
+            if datetime_response:
+                self.parse_datetime(datetime_response)
+            
+            # Request telescope position
+            telpos_response = self.send_single_command("telpos")
+            if telpos_response:
+                self.parse_telpos(telpos_response)
+            
+            # Request telescope data
+            teldata_response = self.send_single_command("teldata")
+            if teldata_response:
+                self.parse_teldata(teldata_response)
+                
+            self.last_update = time.time()
+            
+        except Exception as e:
+            logging.error(f"Error requesting TCS data: {e}")
+    
+    def parse_datetime(self, response):
+        """Parse datetime response: 2025-09-10 13:50:25 08:27:03"""
+        try:
+            parts = response.strip().split()
+            if len(parts) >= 3:
+                with self.data_lock:
+                    self.tcs_data['date'] = parts[0]
+                    self.tcs_data['time'] = parts[1]
+                    self.tcs_data['sidereal_time'] = parts[2]
+        except Exception as e:
+            logging.debug(f"Error parsing datetime: {e}")
+    
+    def parse_telpos(self, response):
+        """Parse telpos response: 08:26:02.36 -28:58:34.3 2000.00 -00:00:01 1.000 172.2522"""
+        try:
+            parts = response.strip().split()
+            if len(parts) >= 6:
+                with self.data_lock:
+                    self.tcs_data['ra'] = parts[0]
+                    self.tcs_data['dec'] = parts[1]
+                    self.tcs_data['equinox'] = parts[2]
+                    self.tcs_data['hour_angle'] = parts[3]
+                    self.tcs_data['airmass'] = parts[4]
+                    self.tcs_data['rotator_angle'] = parts[5]
+        except Exception as e:
+            logging.debug(f"Error parsing telpos: {e}")
+    
+    def parse_teldata(self, response):
+        """Parse teldata response: 3 00 000 0111 168.0006 89.9280 0.0720 -017.7478 045 0"""
+        try:
+            parts = response.strip().split()
+            if len(parts) >= 10:
+                with self.data_lock:
+                    # parts[4] = azimuth, parts[5] = elevation, parts[7] = parallactic angle
+                    self.tcs_data['azimuth'] = parts[4]
+                    self.tcs_data['elevation'] = parts[5]
+                    self.tcs_data['parallactic_angle'] = parts[7]
+        except Exception as e:
+            logging.debug(f"Error parsing teldata: {e}")
+    
+    def get_current_data(self):
+        """Get current TCS data safely"""
+        with self.data_lock:
+            return dict(self.tcs_data)
+    
+    def send_offset(self, ra_offset=0.0, dec_offset=0.0):
+        """Send offset command to TCS
+        
+        Args:
+            ra_offset: RA offset in arcseconds (positive = West)
+            dec_offset: Dec offset in arcseconds (positive = North)
+        """
+        try:
+            success = True
+            
+            # Send offset commands according to TCS documentation
+            # Each command needs its own connection
+            
+            if ra_offset != 0:
+                response = self.send_single_command(f"ofra {ra_offset:.2f}")
+                logging.info(f"TCS ofra {ra_offset:.2f}: {response}")
+                if response is None:
+                    success = False
+                time.sleep(0.1)  # Small delay between commands
+                
+            if dec_offset != 0:
+                response = self.send_single_command(f"ofdc {dec_offset:.2f}")
+                logging.info(f"TCS ofdc {dec_offset:.2f}: {response}")
+                if response is None:
+                    success = False
+                time.sleep(0.1)
+                
+            # Execute the offset
+            response = self.send_single_command("offp")
+            logging.info(f"TCS offp: {response}")
+            if response is None:
+                success = False
+            
+            # Update GUI status if available
+            if self.gui_ref and success:
+                self.gui_ref.after(0, lambda: self.gui_ref.update_status(
+                    f"Telescope offset: RA={ra_offset:+.1f}\" Dec={dec_offset:+.1f}\"", "green"))
+            elif self.gui_ref:
+                self.gui_ref.after(0, lambda: self.gui_ref.update_status(
+                    "Telescope offset failed", "red"))
+            
+            return success
+            
+        except Exception as e:
+            logging.error(f"Error sending telescope offset: {e}")
+            if self.gui_ref:
+                self.gui_ref.after(0, lambda: self.gui_ref.update_status(
+                    f"Offset error: {e}", "red"))
+            return False
+    
+    def reset_offsets(self):
+        """Reset telescope offsets to zero
+        
+        Note: This sends ofra 0 and ofdc 0, but the TCS might interpret this
+        differently than expected. Check TCS documentation for proper reset procedure.
+        """
+        try:
+            # Send zero offsets
+            response1 = self.send_single_command("ofra 0")
+            time.sleep(0.1)
+            response2 = self.send_single_command("ofdc 0")
+            time.sleep(0.1)
+            response3 = self.send_single_command("offp")
+            
+            logging.info(f"Reset offsets - ofra 0: {response1}, ofdc 0: {response2}, offp: {response3}")
+            
+            if self.gui_ref:
+                self.gui_ref.after(0, lambda: self.gui_ref.update_status(
+                    "Telescope offsets reset", "green"))
+            
+            return True
+            
+        except Exception as e:
+            logging.error(f"Error resetting offsets: {e}")
+            return False
+    
+    def stop(self):
+        """Stop TCS thread"""
+        self.running = False
 
 class CameraGUI(tk.Tk):
     """Main GUI application - keeping original layout exactly"""
@@ -1307,6 +1548,12 @@ class CameraGUI(tk.Tk):
         self.save_thread = None
         self.last_frame = None
         self._peripheral_update_running = False
+        self.tcs_thread = TCSThread(gui_ref=self)
+        self.tcs_thread.daemon = True
+        self.tcs_thread.start()
+        self.countdown_active = False
+        self.frame_count = 0
+        self.last_frame_time = None
         
         # Performance monitoring
         self.last_fps_update = time.time()
@@ -1317,7 +1564,7 @@ class CameraGUI(tk.Tk):
         self.max_val = tk.StringVar(value="60000")
 
         self.title("Lightspeed Prototype Control GUI")
-        self.geometry("1000x1080")
+        self.geometry("1100x1080")
 
         self.setup_gui()
 
@@ -1331,14 +1578,14 @@ class CameraGUI(tk.Tk):
 
         # Camera Parameters
         camera_params_frame = LabelFrame(self.main_frame, text="Camera Parameters", padx=5, pady=5)
-        camera_params_frame.grid(row=0, column=0, sticky='nsew')
+        camera_params_frame.grid(row=0, column=0, sticky='ew')
         self.camera_status = tk.Label(camera_params_frame, text="", justify=tk.LEFT, anchor="w")
         self.camera_status.pack(fill='both', expand=True)
 
         # Status messages
         self.status_message = tk.Label(self.main_frame, text="", justify=tk.LEFT, anchor="w", 
                                        width=40, wraplength=400, fg="red")
-        self.status_message.grid(row=4, column=0, sticky='nsew')
+        self.status_message.grid(row=5, column=0, sticky='ew')
 
         # GPS Timestamp display
         gps_frame = LabelFrame(self.main_frame, text="GPS Timestamp", padx=5, pady=5)
@@ -1351,6 +1598,49 @@ class CameraGUI(tk.Tk):
         perf_frame.grid(row=2, column=0, columnspan=1, sticky='ew')
         self.performance_label = tk.Label(perf_frame, text="FPS: -- | Display FPS: -- \n Queue: --", font=("Courier", 10))
         self.performance_label.pack()
+
+        # TCS Status and Control frame
+        tcs_frame = LabelFrame(self.main_frame, text="Telescope Status & Control", padx=5, pady=5)
+        tcs_frame.grid(row=3, column=0, columnspan=1, sticky='ew')
+
+        # Status display
+        self.tcs_status_label = tk.Label(tcs_frame, text="TCS: Connecting...", font=("Courier", 10))
+        self.tcs_status_label.pack()
+
+        # Offset controls
+        offset_control_frame = tk.Frame(tcs_frame)
+        offset_control_frame.pack(pady=5)
+
+        # Offset amount entry
+        tk.Label(offset_control_frame, text="Offset (arcsec):").grid(row=0, column=0, padx=2)
+        self.tcs_offset_amount = tk.DoubleVar(value=5.0)
+        offset_entry = tk.Entry(offset_control_frame, textvariable=self.tcs_offset_amount, width=8)
+        offset_entry.grid(row=0, column=1, padx=2)
+
+        # Directional offset buttons in cross pattern
+        offset_buttons_frame = tk.Frame(tcs_frame)
+        offset_buttons_frame.pack(pady=5)
+
+        # North button (Dec+)
+        tk.Button(offset_buttons_frame, text="N", width=3, 
+                command=lambda: self.send_telescope_offset(dec_offset=1)).grid(row=0, column=1, padx=1, pady=1)
+
+        # West button (RA+) and East button (RA-)
+        tk.Button(offset_buttons_frame, text="W", width=3,
+                command=lambda: self.send_telescope_offset(ra_offset=1)).grid(row=1, column=0, padx=1, pady=1)
+        tk.Button(offset_buttons_frame, text="E", width=3,
+                command=lambda: self.send_telescope_offset(ra_offset=-1)).grid(row=1, column=2, padx=1, pady=1)
+
+        # South button (Dec-)
+        tk.Button(offset_buttons_frame, text="S", width=3,
+                command=lambda: self.send_telescope_offset(dec_offset=-1)).grid(row=2, column=1, padx=1, pady=1)
+
+        # Reset button in center
+        tk.Button(offset_buttons_frame, text="RST", width=3, fg="red",
+                command=self.reset_telescope_offsets).grid(row=1, column=1, padx=1, pady=1)
+        
+        # Start TCS status update loop
+        self.after(5000, self.update_tcs_status)
 
         # Set up control sections
         self.setup_camera_controls()
@@ -1408,18 +1698,17 @@ class CameraGUI(tk.Tk):
     def setup_camera_controls(self):
         """Set up camera control widgets - exactly as original"""
         camera_controls_frame = LabelFrame(self.main_frame, text="Camera Controls", padx=5, pady=5)
-        camera_controls_frame.grid(row=0, column=1, sticky='n')
+        camera_controls_frame.grid(row=0, column=1)
 
         Label(camera_controls_frame, text="Exposure Time (ms):").grid(row=0, column=0)
         self.exposure_time_var = tk.DoubleVar(value=100)
         self.exposure_time_var.trace_add("write", self.update_exposure_time)
         self.exposure_time_entry = Entry(camera_controls_frame, textvariable=self.exposure_time_var)
         self.exposure_time_entry.grid(row=0, column=1)
-
-        self.save_data_var = tk.BooleanVar()
-        self.save_data_checkbox = Checkbutton(camera_controls_frame, text="Save Data to Disk", 
-                                              variable=self.save_data_var)
-        self.save_data_checkbox.grid(row=1, column=0, columnspan=2)
+        
+        # Add countdown timer label
+        self.countdown_label = Label(camera_controls_frame, text="Ready", font=("Courier", 10, "bold"), fg="blue")
+        self.countdown_label.grid(row=1, column=0, columnspan=2)
 
         self.start_button = Button(camera_controls_frame, text="Start", command=self.start_capture)
         self.start_button.grid(row=2, column=0)
@@ -1427,8 +1716,10 @@ class CameraGUI(tk.Tk):
         self.stop_button = Button(camera_controls_frame, text="Stop", command=self.stop_capture)
         self.stop_button.grid(row=2, column=1)
 
-        self.reset_button = Button(camera_controls_frame, text="Reset Camera", command=self.reset_camera)
-        self.reset_button.grid(row=3, column=0, columnspan=2)
+        self.save_data_var = tk.BooleanVar()
+        self.save_data_checkbox = Checkbutton(camera_controls_frame, text="Save Data to Disk", 
+                                            variable=self.save_data_var)
+        self.save_data_checkbox.grid(row=3, column=0, columnspan=2)
 
         Label(camera_controls_frame, text="Object Name:").grid(row=4, column=0)
         self.object_name_entry = Entry(camera_controls_frame)
@@ -1440,18 +1731,21 @@ class CameraGUI(tk.Tk):
         self.cube_size_entry = Entry(camera_controls_frame, textvariable=self.cube_size_var)
         self.cube_size_entry.grid(row=5, column=1)
 
+        self.reset_button = Button(camera_controls_frame, text="Reset Camera", command=self.reset_camera)
+        self.reset_button.grid(row=7, column=0, columnspan=1)
+
         self.power_cycle_button = Button(camera_controls_frame, text="Power Cycle Camera",
-                                         command=self.power_cycle_camera)
-        self.power_cycle_button.grid(row=6, column=0, columnspan=1)
+                                        command=self.power_cycle_camera)
+        self.power_cycle_button.grid(row=7, column=1, columnspan=1)
 
         self.take_flats_button = Button(camera_controls_frame, text="Take Flats",
-                                         command=self.take_flats)
-        self.take_flats_button.grid(row=6, column=1, columnspan=1)
+                                        command=self.take_flats)
+        self.take_flats_button.grid(row=7, column=2, columnspan=1)
 
     def setup_camera_settings(self):
         """Set up camera settings widgets - exactly as original"""
         camera_settings_frame = LabelFrame(self.main_frame, text="Camera Settings", padx=5, pady=5)
-        camera_settings_frame.grid(row=1, column=1, sticky='n')
+        camera_settings_frame.grid(row=2, column=1)
 
         Label(camera_settings_frame, text="Binning:").grid(row=0, column=0)
         self.binning_var = StringVar(value="1x1")
@@ -1482,7 +1776,7 @@ class CameraGUI(tk.Tk):
     def setup_subarray_controls(self):
         """Set up subarray control widgets - exactly as original"""
         subarray_controls_frame = LabelFrame(self.main_frame, text="Subarray Controls", padx=5, pady=5)
-        subarray_controls_frame.grid(row=2, column=1, sticky='n')
+        subarray_controls_frame.grid(row=3, column=1)
 
         Label(subarray_controls_frame, text="Subarray Mode:").grid(row=0, column=0)
         self.subarray_mode_var = StringVar(value="Off")
@@ -1516,7 +1810,7 @@ class CameraGUI(tk.Tk):
     def setup_advanced_controls(self):
         """Set up advanced control widgets - exactly as original"""
         advanced_controls_frame = LabelFrame(self.main_frame, text="Advanced Controls", padx=5, pady=5)
-        advanced_controls_frame.grid(row=3, column=1, sticky='n')
+        advanced_controls_frame.grid(row=1, column=1)
 
         self.framebundle_var = tk.BooleanVar()
         self.framebundle_checkbox = Checkbutton(advanced_controls_frame, text="Enable Frame Bundle", 
@@ -1536,22 +1830,38 @@ class CameraGUI(tk.Tk):
               row=2, column=0, columnspan=2)
 
     def setup_display_controls(self):
-        """Set up display control widgets - exactly as original"""
+        """Set up display control widgets - with auto-scaling options"""
         display_controls_frame = LabelFrame(self.main_frame, text="Display Controls", padx=5, pady=5)
-        display_controls_frame.grid(row=3, column=0, sticky='n')
+        display_controls_frame.grid(row=4, column=0)
 
-        Label(display_controls_frame, text="Min Count:").grid(row=0, column=0)
-        Entry(display_controls_frame, textvariable=self.min_val, width=8).grid(row=0, column=1)
+        # Auto-scaling options
+        self.auto_minmax_var = tk.BooleanVar(value=False)
+        self.auto_minmax_check = Checkbutton(display_controls_frame, text="Auto Min/Max", 
+                                            variable=self.auto_minmax_var, 
+                                            command=lambda: self.toggle_auto_scaling('minmax'))
+        self.auto_minmax_check.grid(row=0, column=0, columnspan=2)
+        
+        self.auto_zscale_var = tk.BooleanVar(value=False)
+        self.auto_zscale_check = Checkbutton(display_controls_frame, text="Auto Zscale", 
+                                            variable=self.auto_zscale_var,
+                                            command=lambda: self.toggle_auto_scaling('zscale'))
+        self.auto_zscale_check.grid(row=0, column=2, columnspan=2)
 
-        Label(display_controls_frame, text="Max Count:").grid(row=0, column=2)
+        # Manual scaling controls
+        Label(display_controls_frame, text="Min Count:").grid(row=1, column=0)
+        self.min_entry = Entry(display_controls_frame, textvariable=self.min_val, width=8)
+        self.min_entry.grid(row=1, column=1)
+
+        Label(display_controls_frame, text="Max Count:").grid(row=1, column=2)
         self.max_val.trace_add("write", self.refresh_frame_display)
-        Entry(display_controls_frame, textvariable=self.max_val, width=8).grid(row=0, column=3)
+        self.max_entry = Entry(display_controls_frame, textvariable=self.max_val, width=8)
+        self.max_entry.grid(row=1, column=3)
 
     def setup_peripherals_controls(self):
         """Set up peripheral control widgets - exactly as original"""
         self.peripherals_controls_frame = LabelFrame(self.main_frame, text="Peripherals Controls", 
                                                      padx=5, pady=5)
-        self.peripherals_controls_frame.grid(row=4, column=1, sticky='n')
+        self.peripherals_controls_frame.grid(row=4, column=1)
 
         # Filter control
         Label(self.peripherals_controls_frame, text="Filter:").grid(row=0, column=0)
@@ -1605,65 +1915,54 @@ class CameraGUI(tk.Tk):
         zoom_preset_frame = Frame(self.peripherals_controls_frame)
         zoom_preset_frame.grid(row=3, column=1, columnspan=3, sticky='w')
         
-        Button(zoom_preset_frame, text="3/4x", width=6, 
-               command=lambda: self.move_zoom_preset(0)).pack(side='left', padx=2)
+        Button(zoom_preset_frame, text="3/4x", width=6,
+               command=lambda: self.move_zoom_preset(300)).pack(side='left', padx=2)
         Button(zoom_preset_frame, text="2x", width=6,
-               command=lambda: self.move_zoom_preset(153)).pack(side='left', padx=2)
+               command=lambda: self.move_zoom_preset(200)).pack(side='left', padx=2)
         Button(zoom_preset_frame, text="3x", width=6,
-               command=lambda: self.move_zoom_preset(306)).pack(side='left', padx=2)
+               command=lambda: self.move_zoom_preset(0)).pack(side='left', padx=2)
         
-        # Zoom reference setting
-        Label(self.peripherals_controls_frame, text="Set Reference:").grid(row=4, column=0, sticky='w')
-        zoom_ref_frame = Frame(self.peripherals_controls_frame)
-        zoom_ref_frame.grid(row=4, column=1, columnspan=3, sticky='w')
-        
-        Button(zoom_ref_frame, text="@100mm", width=7,
-               command=lambda: self.set_zoom_reference(0)).pack(side='left', padx=2)
-        Button(zoom_ref_frame, text="@200mm", width=7,
-               command=lambda: self.set_zoom_reference(153)).pack(side='left', padx=2)
-        Button(zoom_ref_frame, text="@300mm", width=7,
-               command=lambda: self.set_zoom_reference(306)).pack(side='left', padx=2)
-        
+        self.zoom_ref_button = Button(zoom_preset_frame, text="Set 3x pos", width=10, bg='orange',
+                                      command=self.set_zoom_reference).pack(side='left', padx=2)
+
         # Emergency relative movement (with warning)
-        Label(self.peripherals_controls_frame, text="Emergency Relative:", 
+        Label(self.peripherals_controls_frame, text="Relative Zoom Shift (deg):", 
               fg="red", font=("Arial", 9, "bold")).grid(row=5, column=0, sticky='w')
         self.zoom_emergency_var = tk.StringVar(value='0')
         self.zoom_emergency_entry = Entry(self.peripherals_controls_frame, 
                                          textvariable=self.zoom_emergency_var, width=8)
         self.zoom_emergency_entry.grid(row=5, column=1)
-        Button(self.peripherals_controls_frame, text="Move", 
+        Button(self.peripherals_controls_frame, text="Apply", fg='red',
                command=self.emergency_zoom_move).grid(row=5, column=2)
         
-        Label(self.peripherals_controls_frame, text="DO NOT USE UNLESS REQUIRED", 
-              fg="red", font=("Arial", 8, "bold")).grid(row=6, column=0, columnspan=4)
-        Label(self.peripherals_controls_frame, text="(+: toward 300mm, -: toward 100mm)", 
-              font=("Arial", 8), fg="gray").grid(row=7, column=0, columnspan=4)
+        Label(self.peripherals_controls_frame, text="(+: zoom in, -: zoom out)", 
+              font=("Arial", 8), fg="gray").grid(row=5, column=3, columnspan=4)
         ### TBT 
 
         # Focus control - separate row TBT
-        Label(self.peripherals_controls_frame, text="Relative Focus (deg):").grid(row=8, column=0)
+        Label(self.peripherals_controls_frame, text="Relative Focus Shift (deg):").grid(row=6, column=0)
         self.focus_position_var = tk.StringVar(value='0')
         self.focus_position_entry = Entry(self.peripherals_controls_frame, 
                                           textvariable=self.focus_position_var, width=8)
-        self.focus_position_entry.grid(row=8, column=1)
-        self.set_focus_button = Button(self.peripherals_controls_frame, text="Move Focus",
+        self.focus_position_entry.grid(row=6, column=1)
+        self.set_focus_button = Button(self.peripherals_controls_frame, text="Apply",
                                        command=self.update_focus_position)
-        self.set_focus_button.grid(row=8, column=2)
+        self.set_focus_button.grid(row=6, column=2)
         Label(self.peripherals_controls_frame, text="(+: focus far, -: focus near)", 
-              font=("Arial", 8), fg="gray").grid(row=8, column=3, sticky='w')
+              font=("Arial", 8), fg="gray").grid(row=6, column=3, sticky='w')
         ### TBT
 
         # Focus initialization button
         self.focus_init_button = Button(self.peripherals_controls_frame, text="Reset Focus",
                                        command=self.manual_focus_init)
-        self.focus_init_button.grid(row=9, column=0, columnspan=2) #TBT
+        self.focus_init_button.grid(row=7, column=0, columnspan=2) #TBT
         Label(self.peripherals_controls_frame, text="(Initialize to near optimal focus)", 
-              font=("Arial", 8), fg="gray").grid(row=9, column=2, columnspan=2, sticky='w') #TBT
+              font=("Arial", 8), fg="gray").grid(row=7, column=2, columnspan=2, sticky='w') #TBT
 
 
     def setup_pdu_controls(self):
         """Set up PDU outlet control widgets - exactly as original"""
-        Label(self.peripherals_controls_frame, text="PDU Outlet States").grid(row=10, column=0, columnspan=4) #TBT
+        Label(self.peripherals_controls_frame, text="PDU Outlet States").grid(row=8, column=0, columnspan=4) #TBT
         self.pdu_outlet_dict = {
             1: 'Rotator', 2: 'Switch', 3: 'Shutter', 4: 'Empty',
             5: 'Empty', 6: 'Empty', 7: 'Empty', 8: 'Empty',
@@ -1745,43 +2044,107 @@ class CameraGUI(tk.Tk):
                         self.last_frame = frame
                         self.actual_display_count += 1
                         self.process_frame(frame)
+                        
+                        # When we get a frame, update counters for countdown
+                        if self.countdown_active:
+                            self.frame_count += 1
+                            self.last_frame_time = time.time()  # Reset timer for next frame
+                            
                     except queue.Empty:
                         pass
             except Exception as e:
                 debug_logger.error(f"Frame display error: {e}")
         
-        self.after(20, self.update_frame_display)  # ~50 FPS max display rate
+        self.after(20, self.update_frame_display)
 
     def refresh_frame_display(self, *_):
         """Refresh the frame display"""
         if self.last_frame is not None:
             self.process_frame(self.last_frame)
 
+    
+    def toggle_auto_scaling(self, which_clicked):
+        """Handle auto-scaling checkbox changes"""
+        # If one was just turned on, turn off the other
+        if which_clicked == 'minmax' and self.auto_minmax_var.get():
+            self.auto_zscale_var.set(False)
+        elif which_clicked == 'zscale' and self.auto_zscale_var.get():
+            self.auto_minmax_var.set(False)
+        
+        # Enable/disable manual entries based on whether any auto mode is active
+        if self.auto_minmax_var.get() or self.auto_zscale_var.get():
+            self.min_entry.config(state='disabled')
+            self.max_entry.config(state='disabled')
+        else:
+            self.min_entry.config(state='normal')
+            self.max_entry.config(state='normal')
+
+    def compute_zscale(self, data, contrast=0.25, num_samples=10000):
+        """Compute zscale limits for display"""
+        # Flatten and sample the data
+        flat_data = data.flatten()
+        if len(flat_data) > num_samples:
+            indices = np.random.choice(len(flat_data), num_samples, replace=False)
+            sampled_data = flat_data[indices]
+        else:
+            sampled_data = flat_data
+        
+        # Sort the samples
+        sorted_data = np.sort(sampled_data)
+        
+        # Calculate the median
+        median = np.median(sorted_data)
+        
+        # Estimate the noise using median absolute deviation
+        mad = np.median(np.abs(sorted_data - median))
+        if mad == 0:
+            mad = 1.0
+        
+        # Set limits based on contrast
+        zmin = median - (contrast * 10.0 * mad)
+        zmax = median + (contrast * 10.0 * mad)
+        
+        # Clip to data range
+        data_min = np.min(data)
+        data_max = np.max(data)
+        
+        zmin = max(zmin, data_min)
+        zmax = min(zmax, data_max)
+        
+        return int(zmin), int(zmax)
+
     def process_frame(self, data):
-        """Process and display a frame"""
+        """Process and display a frame with auto-scaling support"""
         if not self.display_lock.acquire(blocking=False):
             return
             
         try:
-            # Get display range
-            try:
-                min_val = int(self.min_val.get())
-                max_val = int(self.max_val.get())
-            except:
-                min_val, max_val = 0, 200
+            # Apply auto-scaling if enabled
+            if self.auto_minmax_var.get():
+                # Simple min/max scaling
+                min_val = int(np.min(data))
+                max_val = int(np.max(data))
+            elif self.auto_zscale_var.get():
+                # Zscale algorithm
+                min_val, max_val = self.compute_zscale(data)
+            else:
+                # Use manual values
+                try:
+                    min_val = int(self.min_val.get())
+                    max_val = int(self.max_val.get())
+                except:
+                    min_val, max_val = 0, 200
 
-            if max_val < min_val:
+            if max_val <= min_val:
                 min_val = 0
-                if data.dtype == np.uint16:
-                    max_val = 65535
-                else:
-                    max_val = 255
+                max_val = 65535 if data.dtype == np.uint16 else 255
+                
             scaled_data = np.clip((data.astype(np.float32) - min_val) / (max_val - min_val) * 255, 0, 255).astype(np.uint8)
 
             # Flip horizontally
             scaled_data = cv2.flip(scaled_data, 1)
             
-            # Convert to BGR if needed
+            # Convert to BGR
             if len(scaled_data.shape) == 2:
                 scaled_data_bgr = cv2.cvtColor(scaled_data, cv2.COLOR_GRAY2BGR)
             else:
@@ -1952,6 +2315,18 @@ class CameraGUI(tk.Tk):
             self.update_status("Starting capture...", "blue")
             self.update_gps_timestamp("Waiting for GPS...")
 
+            # Start countdown timer if exposure > 1 second
+            self.frame_count = 0
+            self.last_frame_time = time.time()  # Start timing from capture start
+            
+            # Start countdown if exposure > 1 second
+            if self.exposure_time_var.get() > 1000:
+                self.countdown_active = True
+                self.countdown_label.config(text=f"Frame 1 - {self.exposure_time_var.get() / 1000:.0f}s remaining")
+                self.run_countdown()
+            else:
+                self.countdown_label.config(text="")
+
             # Set up save thread if needed - using optimized save thread
             if self.save_data_var.get():
                 save_queue = queue.Queue(maxsize=50000)
@@ -1983,6 +2358,8 @@ class CameraGUI(tk.Tk):
         """Stop camera capture"""
         try:
             self.update_status("Stopping capture...", "blue")
+            self.countdown_active = False
+            self.countdown_label.config(text="")
             self.camera_thread.stop_capture()
 
             # Stop save thread
@@ -2056,7 +2433,7 @@ class CameraGUI(tk.Tk):
             logging.error(f"Power cycle error: {e}")
 
     def take_flats(self):
-        """Take flat field images cycling through filters"""
+        """Take flat field images cycling through filters with telescope offsets"""
         def _cycle_filters():
             try:
                 # Store original settings
@@ -2066,6 +2443,39 @@ class CameraGUI(tk.Tk):
                 
                 TARGET_MEAN = 40000
                 BIAS_LEVEL = 200
+                
+                # Define offset pattern for 6 frames (in arcseconds)
+                offset_pattern = [
+                    (0, 0),      # Frame 1: original position
+                    (5, 0),      # Frame 2: +5" RA
+                    (5, 5),      # Frame 3: +5" RA, +5" Dec  
+                    (0, 5),      # Frame 4: 0 RA, +5" Dec
+                    (-5, 5),     # Frame 5: -5" RA, +5" Dec
+                    (-5, 0),     # Frame 6: -5" RA, 0 Dec
+                ]
+                
+                # Test if TCS accepts commands with a small test offset
+                tcs_commands_work = False
+                if hasattr(self, 'tcs_thread') and self.tcs_thread:
+                    logging.info("Testing TCS command capability...")
+                    # Try a tiny offset and immediately reverse it
+                    test_success = self.tcs_thread.send_offset(0.1, 0)
+                    if test_success:
+                        # Reverse the test offset
+                        reverse_success = self.tcs_thread.send_offset(-0.1, 0)
+                        if reverse_success:
+                            tcs_commands_work = True
+                            logging.info("TCS accepts commands - will use offsets for flats")
+                            self.after(0, lambda: self.update_status("TCS working - using offsets for flats", "green"))
+                        else:
+                            logging.warning("TCS accepted test offset but failed to reverse - commands unreliable")
+                            self.after(0, lambda: self.update_status("TCS commands unreliable - flats at single position", "orange"))
+                    else:
+                        logging.warning("TCS does not accept commands - will take all flats at current position")
+                        self.after(0, lambda: self.update_status("TCS commands disabled - flats at single position", "orange"))
+                else:
+                    logging.warning("TCS not available - will take all flats at current position")
+                    self.after(0, lambda: self.update_status("TCS unavailable - flats at single position", "orange"))
                 
                 for filter_pos in [6, 1, 2, 3, 4, 5]:
                     # Set filter
@@ -2078,9 +2488,9 @@ class CameraGUI(tk.Tk):
                     
                     # Find appropriate test exposure
                     test_exposure = 0.1  # Start at 100ms
-                    test_mean = 70000  # Start above threshold to enter loop
+                    test_mean = 70000
                     
-                    while test_mean > 60000:
+                    while test_mean > 60000 or test_mean < 1000:
                         self.camera_thread.set_property('EXPOSURE_TIME', test_exposure)
                         while not self.frame_queue.empty():
                             self.frame_queue.get_nowait()
@@ -2096,16 +2506,19 @@ class CameraGUI(tk.Tk):
                         test_mean = np.mean(central_region)
                         
                         if test_mean > 60000:
-                            test_exposure *= 0.1  # Reduce by factor of 10
+                            test_exposure *= 0.1
                             print(f"{filter_name}: Saturated (mean={test_mean:.0f}), trying {test_exposure*1000:.1f}ms")
+                        elif test_mean < 1000:
+                            test_exposure *= 5.0
+                            print(f"{filter_name}: Too low (mean={test_mean:.0f}), trying {test_exposure*1000:.1f}ms")  
                     
                     # Calculate scaled exposure
                     scaled_exposure = test_exposure * (TARGET_MEAN - BIAS_LEVEL) / (test_mean - BIAS_LEVEL)
-                    scaled_exposure = max(0.001, min(30, scaled_exposure))  # Limit 1ms-30s
-                    
+                    scaled_exposure = max(0.001, min(30, scaled_exposure))
+
                     print(f"{filter_name}: test={test_mean:.0f} @ {test_exposure*1000:.1f}ms, scaled={scaled_exposure*1000:.0f}ms")
                     
-                    # Take 5 frames at scaled exposure
+                    # Prepare for capture
                     self.save_data_var.set(True)
                     filter_short = filter_name.split()[0].replace('(', '').replace(')', '')
                     self.object_name_entry.delete(0, tk.END)
@@ -2117,17 +2530,43 @@ class CameraGUI(tk.Tk):
                     while not self.frame_queue.empty():
                         self.frame_queue.get_nowait()
                     
-                    # Start capture WITHOUT save thread first
+                    # Start capture
                     self.camera_thread.save_queue = None
                     self.camera_thread.start_capture()
                     
-                    # Collect exactly 5 frames
+                    # Collect exactly 6 frames
                     frames_to_save = []
                     timestamps_to_save = []
                     framestamps_to_save = []
-                    for i in range(5):
-                        frame = self.frame_queue.get(timeout=scaled_exposure + 1)
-                        # Also get timestamp data
+                    actual_ra_offset = 0
+                    actual_dec_offset = 0
+                    
+                    for i in range(6):
+                        # Only attempt offsets if we confirmed TCS accepts commands
+                        if i > 0 and tcs_commands_work:
+                            ra_offset = offset_pattern[i][0] - offset_pattern[i-1][0]
+                            dec_offset = offset_pattern[i][1] - offset_pattern[i-1][1]
+                            
+                            # Send telescope offset (we already know it should work)
+                            success = self.tcs_thread.send_offset(ra_offset, dec_offset)
+                            
+                            if success:
+                                actual_ra_offset = offset_pattern[i][0]
+                                actual_dec_offset = offset_pattern[i][1]
+                                logging.info(f"Flat frame {i+1}: moved to offset ({offset_pattern[i][0]}\", {offset_pattern[i][1]}\")")
+                                time.sleep(2.0)  # Wait for telescope to settle
+                            else:
+                                # Unexpected failure - disable further offset attempts
+                                logging.warning(f"Unexpected TCS offset failure for frame {i+1} - disabling offsets for remainder")
+                                tcs_commands_work = False
+                                time.sleep(0.5)
+                        elif i > 0 and not tcs_commands_work:
+                            # Log once per filter that we're not offsetting
+                            if i == 1:
+                                logging.info(f"Taking all {filter_name} flats at single position (TCS commands unavailable)")
+                        
+                        # Capture frame
+                        frame = self.frame_queue.get(timeout=scaled_exposure + 2)
                         try:
                             ts, fs = self.timestamp_queue.get_nowait()
                             timestamps_to_save.append(ts)
@@ -2136,20 +2575,36 @@ class CameraGUI(tk.Tk):
                             timestamps_to_save.append(0)
                             framestamps_to_save.append(0)
                         frames_to_save.append(frame)
+                        
+                        logging.info(f"Captured flat frame {i+1}/6 for {filter_name}")
                     
                     self.camera_thread.stop_capture()
                     
-                    # Now save the collected frames directly
+                    # Return to original position only if we moved and TCS still works
+                    if tcs_commands_work and (actual_ra_offset != 0 or actual_dec_offset != 0):
+                        return_ra = -actual_ra_offset
+                        return_dec = -actual_dec_offset
+                        success = self.tcs_thread.send_offset(return_ra, return_dec)
+                        if success:
+                            logging.info(f"Returned to original position for next filter")
+                        else:
+                            logging.warning("Failed to return to original position - may need manual correction")
+                            self.after(0, lambda: self.update_status(
+                                "Warning: Failed to return telescope to original position", "orange"))
+                            # Disable further offsets since return failed
+                            tcs_commands_work = False
+                        time.sleep(2.0)
+                    
+                    # Save the collected frames
                     save_queue = queue.Queue(maxsize=50000)
                     for i, frame in enumerate(frames_to_save):
                         save_queue.put((frame, timestamps_to_save[i], framestamps_to_save[i]))
                     
                     save_thread = OptimizedSaveThread(save_queue, self.camera_thread, self.get_header_info(),
-                                                      self.object_name_entry.get(), self.shared_data)
-                    save_thread.batch_size = 5
+                                                    self.object_name_entry.get(), self.shared_data)
+                    save_thread.batch_size = 6
                     save_thread.start()
                     
-                    # Wait briefly for save to complete
                     time.sleep(2.0)
                     save_thread.stop()
                     save_thread.join(timeout=5)
@@ -2274,68 +2729,32 @@ class CameraGUI(tk.Tk):
         
         self.peripherals_thread.executor.submit(_update)
 
-# TBT
-    # def update_zoom_position(self, *_):
-    #     """Update zoom position (relative movement)"""
-    #     def _update():
-    #         try:
-    #             if self.peripherals_thread.ax_a_2 is None:
-    #                 self.update_status("Zoom motor not connected", "red")
-    #                 return
-                    
-    #             relative_position = float(self.zoom_position_var.get())
-    #             if abs(relative_position) < 0.1:  # Minimum movement threshold
-    #                 self.update_status("Zoom movement too small", "orange")
-    #                 return
-                    
-    #             with self.peripherals_thread.peripherals_lock:
-    #                 # Get current position first
-    #                 current_pos = self.peripherals_thread.ax_a_2.get_position(Units.ANGLE_DEGREES)
-    #                 new_position = current_pos + relative_position
-    #                 self.peripherals_thread.ax_a_2.move_absolute(new_position, Units.ANGLE_DEGREES)
-                    
-    #             self.update_status(f"Zoom moved {relative_position:+.1f}° (toward {'zoom in' if relative_position > 0 else 'zoom out'})", "green")
-    #             # Reset entry to 0 after movement
-    #             self.after(100, lambda: self.zoom_position_var.set('0'))
-                
-    #         except ValueError:
-    #             self.update_status("Invalid zoom value", "red")
-    #         except Exception as e:
-    #             debug_logger.error(f"Zoom error: {e}")
-    #             self.update_status("Zoom movement failed", "red")
-        
-    #     self.peripherals_thread.executor.submit(_update)
-### TBT
     def move_zoom_preset(self, virtual_position):
             """Move zoom to preset position"""
             if not self.peripherals_thread.zoom_reference_set:
                 messagebox.showerror("Reference Not Set", 
-                                "Please set zoom reference position first using one of the '@' buttons.")
+                                "Please set 3x zoom-out reference position.")
                 return
-                
-            focal_length = self.peripherals_thread.virtual_to_focal_length(virtual_position)
-            self.update_status(f"Moving zoom to {focal_length}mm...", "blue")
             
+            response = messagebox.askyesno("Set Zoom Preset", "Move to zoom pre-set?")
+
             def _move():
                 if self.peripherals_thread.move_zoom_to_virtual(virtual_position):
-                    self.update_status(f"Zoom at {focal_length}mm", "green")
+                    self.update_status(f"Zoom at {virtual_position}", "green")
                 else:
                     self.update_status("Zoom movement failed", "red")
-            
-            self.peripherals_thread.executor.submit(_move)
+            if response:
+                self.peripherals_thread.executor.submit(_move)
 
-    def set_zoom_reference(self, virtual_position):
+    def set_zoom_reference(self):
         """Set current position as reference for virtual coordinate system"""
-        focal_length = self.peripherals_thread.virtual_to_focal_length(virtual_position)
-        
         response = messagebox.askyesno("Set Zoom Reference", 
-            f"Set current zoom position as {focal_length}mm reference?\n\n"
-            f"Make sure the lens is actually at {focal_length}mm before confirming.")
+            f"Set current zoom position as 3x zoom-out reference?")
         
         if response:
             def _set_ref():
-                if self.peripherals_thread.set_zoom_reference(virtual_position):
-                    self.update_status(f"Zoom reference set at {focal_length}mm", "green")
+                if self.peripherals_thread.set_zoom_reference():
+                    self.update_status(f"Zoom reference set at 3x zoom-out", "green")
                 else:
                     self.update_status("Failed to set zoom reference", "red")
             
@@ -2349,11 +2768,9 @@ class CameraGUI(tk.Tk):
                 self.update_status("Movement too small", "orange")
                 return
                 
-            # Multiple warnings for emergency movement
-            response = messagebox.askyesno("EMERGENCY MOVEMENT WARNING", 
+            response = messagebox.askyesno("MOVEMENT WARNING", 
                 f"You are about to move {relative_degrees:+.1f}° relatively.\n\n"
-                f"Direction: {'Toward 300mm (longer focal length)' if relative_degrees > 0 else 'Toward 100mm (shorter focal length)'}\n\n"
-                f"This bypasses safety systems and may hit mechanical limits!\n\n"
+                f"This may hit mechanical limits!\n\n"
                 f"Are you absolutely sure?")
             
             if not response:
@@ -2370,7 +2787,7 @@ class CameraGUI(tk.Tk):
             self.update_status(f"Emergency zoom move {relative_degrees:+.1f}°...", "orange")
             
             def _emergency_move():
-                if self.peripherals_thread.move_zoom_relative_emergency(relative_degrees):
+                if self.peripherals_thread.move_zoom_relative(relative_degrees):
                     self.update_status(f"Emergency move {relative_degrees:+.1f}° complete", "orange")
                     self.after(100, lambda: self.zoom_emergency_var.set('0'))
                 else:
@@ -2380,7 +2797,7 @@ class CameraGUI(tk.Tk):
             
         except ValueError:
             self.update_status("Invalid emergency movement value", "red")
-### TBT
+
     def update_focus_position(self, *_):
         """Update focus position (relative movement)"""
         def _update():
@@ -2439,15 +2856,136 @@ class CameraGUI(tk.Tk):
         except Exception as e:
             debug_logger.error(f"Toggle outlet error: {e}")
 
+    def run_countdown(self):
+        """Simple countdown that runs continuously during capture"""
+        if not self.countdown_active or not self.camera_thread.capturing:
+            self.countdown_label.config(text="")
+            return
+        
+        # Calculate elapsed time since last frame (or start)
+        elapsed = time.time() - self.last_frame_time
+        remaining = max(0, self.exposure_time_var.get() / 1000 - elapsed)
+
+        if remaining > 0:
+            # Still exposing
+            if remaining >= 10:
+                text = f"Frame {self.frame_count + 1} - {remaining:.0f}s remaining"
+            else:
+                text = f"Frame {self.frame_count + 1} - {remaining:.1f}s remaining"
+            self.countdown_label.config(text=text)
+        else:
+            # Exposure complete, waiting for readout
+            text = f"Frame {self.frame_count + 1} - Reading..."
+            self.countdown_label.config(text=text)
+        
+        # Schedule next update
+        self.after(100, self.run_countdown)
+
+    def update_tcs_status(self):
+        """Update TCS status display"""
+        if hasattr(self, 'tcs_thread') and self.tcs_thread:
+            # Check if data is recent (within last 10 seconds)
+            data_age = time.time() - self.tcs_thread.last_update
+            
+            if data_age < 10:  # Data is recent, so TCS is responding
+                tcs_data = self.tcs_thread.get_current_data()
+                status_text = f"TCS: Connected | RA: {tcs_data['ra']} | Dec: {tcs_data['dec']} | Airmass: {tcs_data['airmass']}"
+                self.tcs_status_label.config(text=status_text, fg="green")
+            else:
+                # Data is stale, TCS might not be responding
+                self.tcs_status_label.config(text=f"TCS: No recent data ({data_age:.0f}s old)", fg="orange")
+        else:
+            self.tcs_status_label.config(text="TCS: Thread not running", fg="red")
+        
+        self.after(5000, self.update_tcs_status)
+
+    def send_telescope_offset(self, ra_offset=0, dec_offset=0):
+        """Send telescope offset command
+        
+        Args:
+            ra_offset: Direction multiplier for RA (+1 for West, -1 for East)
+            dec_offset: Direction multiplier for Dec (+1 for North, -1 for South)
+        """
+        if not hasattr(self, 'tcs_thread') or not self.tcs_thread:
+            self.update_status("TCS not available", "red")
+            return
+            
+        try:
+            offset_amount = self.tcs_offset_amount.get()
+            actual_ra_offset = ra_offset * offset_amount
+            actual_dec_offset = dec_offset * offset_amount
+            
+            # Send offset command
+            success = self.tcs_thread.send_offset(actual_ra_offset, actual_dec_offset)
+            
+            if success:
+                direction = ""
+                if ra_offset > 0:
+                    direction = "West"
+                elif ra_offset < 0:
+                    direction = "East"
+                if dec_offset > 0:
+                    direction = "North" if not direction else direction + "+North"
+                elif dec_offset < 0:
+                    direction = "South" if not direction else direction + "+South"
+                    
+                self.update_status(f"Offset {offset_amount}\" {direction}", "green")
+            else:
+                self.update_status("Offset failed - check TCS connection", "red")
+                
+        except Exception as e:
+            logging.error(f"Telescope offset error: {e}")
+            self.update_status(f"Offset error: {e}", "red")
+    
+    def reset_telescope_offsets(self):
+        """Reset telescope offsets to zero"""
+        if not hasattr(self, 'tcs_thread') or not self.tcs_thread:
+            self.update_status("TCS not available", "red")
+            return
+            
+        if self.tcs_thread.reset_offsets():
+            self.update_status("Telescope offsets reset", "green")
+        else:
+            self.update_status("Reset failed - check TCS connection", "red")
+
     def get_header_info(self):
-        """Get header info for FITS files"""
+        """Get header info for FITS files including telescope parameters"""
         header_info = {}
-        # Want to include filter position, shutter status, slit stage status, halpha stage status, wedowostage status
+        
+        # Instrument parameters
         header_info['FILTER'] = self.filter_position_var.get()
         header_info['SHUTTER'] = self.shutter_var.get()
         header_info['SLIT'] = self.slit_position_var.get()
         header_info['HALPHA'] = self.halpha_qwp_var.get()
         header_info['POLSTAGE'] = self.wire_grid_var.get()
+        
+        # Get telescope parameters from TCS thread
+        if hasattr(self, 'tcs_thread') and self.tcs_thread:
+            tcs_data = self.tcs_thread.get_current_data()
+            
+            # Add telescope parameters to header
+            header_info['TELRA'] = (tcs_data.get('ra', 'N/A'), 'Telescope Right Ascension')
+            header_info['TELDEC'] = (tcs_data.get('dec', 'N/A'), 'Telescope Declination')
+            header_info['TELEQUIN'] = (tcs_data.get('equinox', 'N/A'), 'Telescope coordinate epoch')
+            header_info['TELROT'] = (tcs_data.get('rotator_angle', 'N/A'), 'Rotator angle (degrees)')
+            header_info['TELPA'] = (tcs_data.get('parallactic_angle', 'N/A'), 'Parallactic angle (degrees)')
+            header_info['AIRMASS'] = (tcs_data.get('airmass', 'N/A'), 'Airmass')
+            header_info['TELEL'] = (tcs_data.get('elevation', 'N/A'), 'Telescope elevation (degrees)')
+            header_info['TELAZ'] = (tcs_data.get('azimuth', 'N/A'), 'Telescope azimuth (degrees)')
+            header_info['TELHA'] = (tcs_data.get('hour_angle', 'N/A'), 'Hour angle')
+            header_info['TELST'] = (tcs_data.get('sidereal_time', 'N/A'), 'Sidereal time')
+            header_info['DATEOBS'] = (tcs_data.get('date', 'N/A'), 'Observation date')
+            header_info['TELUT'] = (tcs_data.get('time', 'N/A'), 'UT time from telescope')
+            
+            # Log if data is stale
+            if hasattr(self.tcs_thread, 'last_update'):
+                data_age = time.time() - self.tcs_thread.last_update
+                if data_age > 10:
+                    logging.warning(f"TCS data is {data_age:.1f} seconds old")
+                    header_info['TCSAGE'] = (data_age, 'Age of TCS data in seconds')
+        else:
+            logging.warning("TCS thread not available - telescope parameters not included")
+        
         return header_info
 
     def on_close(self):
@@ -2483,6 +3021,12 @@ class CameraGUI(tk.Tk):
             if self.peripherals_thread:
                 logging.info("Disconnecting peripherals")
                 self.peripherals_thread.disconnect_peripherals()
+
+            # Stop TCS thread
+            if hasattr(self, 'tcs_thread') and self.tcs_thread:
+                logging.info("Stopping TCS thread")
+                self.tcs_thread.stop()
+                self.tcs_thread.join(timeout=2)
 
             # Destroy GUI
             logging.info("Destroying GUI")
@@ -2524,7 +3068,7 @@ def main():
         
         # Create and start peripherals thread
         peripherals_thread = PeripheralsThread(
-            shared_data, "200.28.147.143", "/dev/ttyACM0", "/dev/ttyACM1", app)
+            shared_data, "10.8.105.32", "/dev/ttyACM0", "/dev/ttyACM1", app)
         peripherals_thread.daemon = True
         peripherals_thread.start()
         

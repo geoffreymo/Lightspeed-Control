@@ -10,7 +10,7 @@
     "min_val_c": 0,
     "max_val_c": 65000,
     "corner_size": 1000,
-    "exposure_time": "10",
+    "exposure_time": "10000",
     "binning": "1x1",
     "bit_depth": "16-bit",
     "readout_speed": "Standard Mode",

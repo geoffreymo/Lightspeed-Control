@@ -64,6 +64,7 @@ def get_first_timestamp():
 
     # Retrieve the first timestamp from the buffer
     ucap_event = PCPS_HR_TIME()
+    print(ucap_event)
     rc = libmbg.mbg_get_ucap_event(device_handle, byref(ucap_event))
     #libmbg.mbg_close_device(device_handle)
 

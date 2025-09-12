@@ -731,7 +731,9 @@ class TCSGUI:
             # Send TCS offset commands (Table 13 in documentation)
             self.worker.send_command(f"ofra {ra_offset}")
             self.worker.send_command(f"ofdc {dec_offset}")
-            self.worker.send_command("offp")  # Execute the offset
+            # wait a second
+            time.sleep(1)
+            self.worker.send_command("offp ")  # Execute the offset
             
             self.log_message(f"Offset command sent: {direction.upper()} "
                            f"(RA: {ra_offset:+.1f}\", DEC: {dec_offset:+.1f}\")")
