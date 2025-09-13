@@ -29,7 +29,7 @@ from multiprocessing import Process, Queue as MPQueue
 import psutil
 import socket
 import re
-from collections import defaultdict
+from collections import defaultdict, deque
 
 # Load required library
 ctypes.CDLL("libudev.so.1", mode=ctypes.RTLD_GLOBAL)
@@ -242,17 +242,13 @@ class CameraThread(threading.Thread):
                     continue
                 
                 if self.capturing and not self.stop_requested.is_set():
-                    # Simple watchdog check
-                    # Check if exposure time is longer than 1 minutes
-                    if self.gui_ref is not None and self.gui_ref.exposure_time_var.get() > 60000.0:
-                        if self.watchdog_enabled and time.time() - self.last_capture_time > 1801.0:
-                            logging.error("Capture watchdog triggered")
+                    exp_time_s = self.dcam.prop_getvalue(CAMERA_PARAMS['EXPOSURE_TIME'])
+                    if self.gui_ref is not None and self.watchdog_enabled:
+                        if time.time() - self.last_capture_time > exp_time_s + 2.0:
+                            logging.error("Capture watchdog triggered due to timeout")
                             self.reset_capture_state()
-                    elif self.watchdog_enabled and time.time() - self.last_capture_time > 61.0:
-                        logging.error("Capture watchdog triggered")
-                        self.reset_capture_state()
-                    else:
-                        self.capture_frame()
+                        else:
+                            self.capture_frame()
                 else:
                     time.sleep(0.01)
                     
@@ -371,7 +367,7 @@ class CameraThread(threading.Thread):
         try:
             with ThreadPoolExecutor(max_workers=1) as executor:
                 future = executor.submit(GPS_time.get_first_timestamp)
-                self.start_time = future.result(timeout=1.0)
+                self.start_time = future.result(timeout=3.0)
                 
                 if self.start_time:
                     logging.info(f"GPS timestamp: {self.start_time.isot}")
@@ -511,7 +507,7 @@ class CameraThread(threading.Thread):
             'OUTPUT_TRIG_KIND_0': 3.0,
             'OUTPUT_TRIG_ACTIVE_0': 1.0,
             'OUTPUT_TRIG_POLARITY_0': 1.0,
-            'OUTPUT_TRIG_PERIOD_0': 10,
+            'OUTPUT_TRIG_PERIOD_0': 10.0,
             'SENSOR_MODE': 1.0,
             'IMAGE_PIXEL_TYPE': 2.0
         }
@@ -669,6 +665,7 @@ class OptimizedSaveThread(threading.Thread):
         self.framestamp_buffer = []
         self.cube_index = 0
         self.shared_data = shared_data
+        self.save_folder = "captures"
         
         # Use thread pool for async I/O instead of process pool to avoid serialization overhead
         self.executor = ThreadPoolExecutor(max_workers=2)
@@ -680,7 +677,13 @@ class OptimizedSaveThread(threading.Thread):
             logging.info("Save thread started")
             
             start_time_filename_str = time.strftime('%Y%m%d_%H%M%S')
-            os.makedirs("captures", exist_ok=True)
+            # Create a new folder for each night of observations
+            if time.localtime().tm_hour < 12:
+                date_str = time.strftime('%Y_%m_%d', time.localtime(time.time() - 86400))
+            else:
+                date_str = time.strftime('%Y_%m_%d')
+            self.save_folder = f"/nvme-data/Lightspeed/captures_{date_str}"
+            os.makedirs(self.save_folder, exist_ok=True)
 
             while self.running or not self.save_queue.empty():
                 try:
@@ -725,8 +728,8 @@ class OptimizedSaveThread(threading.Thread):
         try:
             self.cube_index += 1
             filename = f"{self.object_name}_{start_time_filename_str}_cube{self.cube_index:03d}.fits"
-            filepath = os.path.join("captures", filename)
-            
+            filepath = os.path.join(self.save_folder, filename)
+
             logging.info(f"Queuing cube {self.cube_index} ({len(self.frame_buffer)} frames) for async write")
 
             # Important: Don't create numpy array here! Just pass references
@@ -773,6 +776,10 @@ class OptimizedSaveThread(threading.Thread):
             # Create FITS HDUs
             primary_hdu = fits.PrimaryHDU()
             primary_hdu.header['OBJECT'] = (object_name, 'Object name')
+            if self.camera_thread.start_time is not None:
+                primary_hdu.header['GPSSTART'] = (str(self.camera_thread.start_time.isot), 'GPS timestamp when data acquisition started')
+            else:
+                primary_hdu.header['GPSSTART'] = ('N/A', 'No GPS timestamp available')
             primary_hdu.header['CUBEIDX'] = (cube_index, 'Cube index number')
 
             image_hdu = fits.ImageHDU(data=data_cube)
@@ -878,9 +885,14 @@ class PeripheralsThread(threading.Thread):
         self.ax_b_3 = None  # Halpha/QWP stage
 
         # Zoom tracking
-        self.zoom_virtual_position = 153.0  # Start at middle (200mm equivalent)
+        self.zoom_virtual_position = None
         self.zoom_reference_set = False
         self.zoom_reference_position = None
+
+        # Focus tracking
+        self.focus_virtual_position = None
+        self.focus_reference_set = False
+        self.focus_reference_position = None
 
     def run(self):
         """Main peripherals thread"""
@@ -935,7 +947,8 @@ class PeripheralsThread(threading.Thread):
         try:
             with self.peripherals_lock:
                 self.ljm_handle = ljm.openS("T4", "ANY", "ANY")
-                logging.info("LabJack connected")
+                ljm.eWriteName(self.ljm_handle, "DIO4", 0.0)
+                logging.info("LabJack connected and shutter opened")
         except Exception as e:
             logging.warning(f"LabJack connection failed: {e}")
 
@@ -1162,7 +1175,9 @@ class PeripheralsThread(threading.Thread):
                     
                     # Wait for movement to complete
                     self.ax_b_1.wait_until_idle()
-                    
+                    self.focus_reference_position = optimal_pos
+                    self.focus_virtual_position = -75
+                    self.focus_reference_set = True
                     logging.info("Focus initialization sequence complete")
                     
                     # Update GUI status
@@ -1181,7 +1196,7 @@ class PeripheralsThread(threading.Thread):
         
         # Run in executor to avoid blocking
         self.executor.submit(_focus_init)
-###TBT
+
     def set_zoom_reference(self):
             """Set current physical position as reference for a virtual position of zero"""
             try:
@@ -1206,7 +1221,6 @@ class PeripheralsThread(threading.Thread):
                 return False
             
             physical_target = self.zoom_reference_position + virtual_target
-            print(self.zoom_virtual_position, virtual_target, self.zoom_reference_position, physical_target)
             
             with self.peripherals_lock:
                 self.ax_a_2.move_absolute(physical_target, Units.ANGLE_DEGREES)
@@ -1240,7 +1254,6 @@ class PeripheralsThread(threading.Thread):
             logging.error(f"Emergency zoom move error: {e}")
             return False
 
-###TBT###
     def disconnect_peripherals(self):
         """Disconnect all peripherals"""
         logging.info("Disconnecting peripherals")
@@ -1316,6 +1329,7 @@ class TCSThread(threading.Thread):
             'rotator_angle': 'N/A',
             'parallactic_angle': 'N/A',
             'airmass': 'N/A',
+            'rotator_encoder_angle': 'N/A',
             'elevation': 'N/A',
             'azimuth': 'N/A',
             'hour_angle': 'N/A',
@@ -1395,6 +1409,8 @@ class TCSThread(threading.Thread):
             telpos_response = self.send_single_command("telpos")
             if telpos_response:
                 self.parse_telpos(telpos_response)
+            rotatore_response = self.send_single_command("rotatore")
+            self.tcs_data['rotator_encoder_angle'] = rotatore_response.strip() if rotatore_response else 'N/A'
             
             # Request telescope data
             teldata_response = self.send_single_command("teldata")
@@ -1467,21 +1483,21 @@ class TCSThread(threading.Thread):
             if ra_offset != 0:
                 response = self.send_single_command(f"ofra {ra_offset:.2f}")
                 logging.info(f"TCS ofra {ra_offset:.2f}: {response}")
-                if response is None:
+                if response == '-1' or response is None:
                     success = False
                 time.sleep(0.1)  # Small delay between commands
                 
             if dec_offset != 0:
                 response = self.send_single_command(f"ofdc {dec_offset:.2f}")
                 logging.info(f"TCS ofdc {dec_offset:.2f}: {response}")
-                if response is None:
+                if response == '-1' or response is None:
                     success = False
                 time.sleep(0.1)
                 
             # Execute the offset
             response = self.send_single_command("offp")
             logging.info(f"TCS offp: {response}")
-            if response is None:
+            if response == '-1' or response is None:
                 success = False
             
             # Update GUI status if available
@@ -1554,6 +1570,11 @@ class CameraGUI(tk.Tk):
         self.countdown_active = False
         self.frame_count = 0
         self.last_frame_time = None
+        self.frame_sum_enabled = tk.BooleanVar(value=False)
+        self.frame_sum_count = tk.IntVar(value=5)
+        self.frame_buffer = deque(maxlen=50)  # Circular buffer for frames
+        self.summed_frame = None
+        self.frames_in_sum = 0
         
         # Performance monitoring
         self.last_fps_update = time.time()
@@ -1586,22 +1607,19 @@ class CameraGUI(tk.Tk):
         self.status_message = tk.Label(self.main_frame, text="", justify=tk.LEFT, anchor="w", 
                                        width=40, wraplength=400, fg="red")
         self.status_message.grid(row=5, column=0, sticky='ew')
-
-        # GPS Timestamp display
-        gps_frame = LabelFrame(self.main_frame, text="GPS Timestamp", padx=5, pady=5)
-        gps_frame.grid(row=1, column=0, columnspan=1, sticky='ew')
-        self.gps_timestamp_label = tk.Label(gps_frame, text="No capture active", font=("Courier", 12))
-        self.gps_timestamp_label.pack()
         
         # Performance display
-        perf_frame = LabelFrame(self.main_frame, text="Performance", padx=5, pady=5)
-        perf_frame.grid(row=2, column=0, columnspan=1, sticky='ew')
+        perf_frame = LabelFrame(self.main_frame, text="Performance Monitor", padx=5, pady=5)
+        perf_frame.grid(row=1, column=0, columnspan=1, sticky='ew')
         self.performance_label = tk.Label(perf_frame, text="FPS: -- | Display FPS: -- \n Queue: --", font=("Courier", 10))
         self.performance_label.pack()
+        tk.Label(perf_frame, text="GPS Timestamp:", font=("Courier", 12)).pack()
+        self.gps_timestamp_label = tk.Label(perf_frame, text="No capture active", font=("Courier", 12))
+        self.gps_timestamp_label.pack()
 
         # TCS Status and Control frame
         tcs_frame = LabelFrame(self.main_frame, text="Telescope Status & Control", padx=5, pady=5)
-        tcs_frame.grid(row=3, column=0, columnspan=1, sticky='ew')
+        tcs_frame.grid(row=2, column=0, columnspan=1, sticky='ew')
 
         # Status display
         self.tcs_status_label = tk.Label(tcs_frame, text="TCS: Connecting...", font=("Courier", 10))
@@ -1649,6 +1667,7 @@ class CameraGUI(tk.Tk):
         self.setup_advanced_controls()
         self.setup_display_controls()
         self.setup_peripherals_controls()
+        self.setup_calibration_controls()
         
         # Start update loops
         self.after(100, self.update_camera_status)
@@ -1738,9 +1757,26 @@ class CameraGUI(tk.Tk):
                                         command=self.power_cycle_camera)
         self.power_cycle_button.grid(row=7, column=1, columnspan=1)
 
-        self.take_flats_button = Button(camera_controls_frame, text="Take Flats",
+    def setup_calibration_controls(self):
+        calibration_controls_frame = LabelFrame(self.main_frame, text="Calibration Controls", padx=5, pady=5)
+        calibration_controls_frame.grid(row=4, column=0)
+
+        self.take_biases_button = Button(calibration_controls_frame, text="Take Biases",
+                                        command=self.take_biases, state='normal')
+        self.take_biases_button.grid(row=0, column=0, columnspan=2)
+        
+        self.take_darks_button = Button(calibration_controls_frame, text="Take Darks",
+                                        command=self.take_darks, state='normal')
+        self.take_darks_button.grid(row=1, column=0, columnspan=2)
+
+        self.take_flats_button = Button(calibration_controls_frame, text="Take Flats",
                                         command=self.take_flats)
-        self.take_flats_button.grid(row=7, column=2, columnspan=1)
+        self.take_flats_button.grid(row=2, column=0, columnspan=2)
+
+        Label(calibration_controls_frame, text="Filters for flats:").grid(row=3, column=0, columnspan=1)
+        self.flat_filter_pos_entry = Entry(calibration_controls_frame, width=12)
+        self.flat_filter_pos_entry.insert(0, "6,1,2,3,4,5")
+        self.flat_filter_pos_entry.grid(row=3, column=1, columnspan=1)
 
     def setup_camera_settings(self):
         """Set up camera settings widgets - exactly as original"""
@@ -1778,34 +1814,34 @@ class CameraGUI(tk.Tk):
         subarray_controls_frame = LabelFrame(self.main_frame, text="Subarray Controls", padx=5, pady=5)
         subarray_controls_frame.grid(row=3, column=1)
 
-        Label(subarray_controls_frame, text="Subarray Mode:").grid(row=0, column=0)
+        Label(subarray_controls_frame, text="Subarray Mode:").grid(row=0, column=0, columnspan=2)
         self.subarray_mode_var = StringVar(value="Off")
         self.subarray_mode_menu = OptionMenu(subarray_controls_frame, self.subarray_mode_var, 
                                              "Off", "On", command=self.change_subarray_mode)
-        self.subarray_mode_menu.grid(row=0, column=1)
+        self.subarray_mode_menu.grid(row=0, column=2, columnspan=2)
 
         # Subarray position and size controls
         subarray_params = [
-            ("HPOS", 0, 1),
-            ("HSIZE", 4096, 2),
-            ("VPOS", 0, 3),
-            ("VSIZE", 2304, 4)
+            ("HPOS", 0, 1, 0),
+            ("HSIZE", 4096, 1, 2),
+            ("VPOS", 0, 2, 0),
+            ("VSIZE", 2304, 2, 2)
         ]
         
         self.subarray_vars = {}
         self.subarray_entries = {}
         
-        for param, default, row in subarray_params:
-            Label(subarray_controls_frame, text=f"Subarray {param}:").grid(row=row, column=0)
+        for param, default, row, col in subarray_params:
+            Label(subarray_controls_frame, text=f"{param}:").grid(row=row, column=col)
             var = tk.IntVar(value=default)
             var.trace_add("write", self.update_subarray)
             self.subarray_vars[param] = var
-            entry = Entry(subarray_controls_frame, textvariable=var, state='disabled')
-            entry.grid(row=row, column=1)
+            entry = Entry(subarray_controls_frame, textvariable=var, state='disabled', width=8)
+            entry.grid(row=row, column=col+1)
             self.subarray_entries[param] = entry
 
         Label(subarray_controls_frame, text="Note: Values rounded to nearest factor of 4.").grid(
-            row=5, column=0, columnspan=2)
+            row=5, column=0, columnspan=4)
 
     def setup_advanced_controls(self):
         """Set up advanced control widgets - exactly as original"""
@@ -1826,36 +1862,63 @@ class CameraGUI(tk.Tk):
         self.frames_per_bundle_entry.grid(row=1, column=1)
         
         Label(advanced_controls_frame, 
-              text="When enabled, frames are\nconcatenated into one image.").grid(
+              text="This concatenates frames into one image.").grid(
               row=2, column=0, columnspan=2)
 
     def setup_display_controls(self):
-        """Set up display control widgets - with auto-scaling options"""
+        """Set up display control widgets - with auto-scaling and frame summing options"""
         display_controls_frame = LabelFrame(self.main_frame, text="Display Controls", padx=5, pady=5)
-        display_controls_frame.grid(row=4, column=0)
+        display_controls_frame.grid(row=3, column=0)
 
-        # Auto-scaling options
+        # Frame summing controls - add these BEFORE auto-scaling options
+        sum_frame = Frame(display_controls_frame)
+        sum_frame.grid(row=0, column=0, columnspan=4, pady=5)
+        
+        self.sum_frames_check = Checkbutton(sum_frame, text="Sum Frames:", 
+                                           variable=self.frame_sum_enabled,
+                                           command=self.toggle_frame_summing)
+        self.sum_frames_check.pack(side='left', padx=2)
+        
+        self.sum_count_spinbox = tk.Spinbox(sum_frame, from_=2, to=50, width=5,
+                                           textvariable=self.frame_sum_count,
+                                           command=self.update_sum_count)
+        self.sum_count_spinbox.pack(side='left', padx=2)
+        
+        Label(sum_frame, text="frames").pack(side='left', padx=2)
+        
+        # Sum mode selection
+        self.sum_mode_var = tk.StringVar(value="Average")
+        self.sum_mode_menu = OptionMenu(sum_frame, self.sum_mode_var,
+                                       "Average", "Sum", "Median",
+                                       command=self.update_sum_mode)
+        self.sum_mode_menu.pack(side='left', padx=5)
+        
+        # Status label for summing
+        self.sum_status_label = Label(sum_frame, text="", font=("Arial", 9), fg="blue")
+        self.sum_status_label.pack(side='left', padx=10)
+
+        # Auto-scaling options (move down a row)
         self.auto_minmax_var = tk.BooleanVar(value=False)
         self.auto_minmax_check = Checkbutton(display_controls_frame, text="Auto Min/Max", 
                                             variable=self.auto_minmax_var, 
                                             command=lambda: self.toggle_auto_scaling('minmax'))
-        self.auto_minmax_check.grid(row=0, column=0, columnspan=2)
+        self.auto_minmax_check.grid(row=1, column=0, columnspan=2)
         
         self.auto_zscale_var = tk.BooleanVar(value=False)
         self.auto_zscale_check = Checkbutton(display_controls_frame, text="Auto Zscale", 
                                             variable=self.auto_zscale_var,
                                             command=lambda: self.toggle_auto_scaling('zscale'))
-        self.auto_zscale_check.grid(row=0, column=2, columnspan=2)
+        self.auto_zscale_check.grid(row=1, column=2, columnspan=2)
 
-        # Manual scaling controls
-        Label(display_controls_frame, text="Min Count:").grid(row=1, column=0)
+        # Manual scaling controls (move down a row)
+        Label(display_controls_frame, text="Min Count:").grid(row=2, column=0)
         self.min_entry = Entry(display_controls_frame, textvariable=self.min_val, width=8)
-        self.min_entry.grid(row=1, column=1)
+        self.min_entry.grid(row=2, column=1)
 
-        Label(display_controls_frame, text="Max Count:").grid(row=1, column=2)
+        Label(display_controls_frame, text="Max Count:").grid(row=2, column=2)
         self.max_val.trace_add("write", self.refresh_frame_display)
         self.max_entry = Entry(display_controls_frame, textvariable=self.max_val, width=8)
-        self.max_entry.grid(row=1, column=3)
+        self.max_entry.grid(row=2, column=3)
 
     def setup_peripherals_controls(self):
         """Set up peripheral control widgets - exactly as original"""
@@ -2034,7 +2097,7 @@ class CameraGUI(tk.Tk):
         self.after(2000, self.update_camera_status)
 
     def update_frame_display(self):
-        """Update frame display - optimized for smooth display"""
+        """Update frame display - optimized for smooth display with summing support"""
         if self.updating_frame_display:
             try:
                 # Process only one frame per update for smoother display
@@ -2043,7 +2106,12 @@ class CameraGUI(tk.Tk):
                         frame = self.frame_queue.get_nowait()
                         self.last_frame = frame
                         self.actual_display_count += 1
-                        self.process_frame(frame)
+                        
+                        # Handle frame summing if enabled
+                        if self.frame_sum_enabled.get():
+                            self.add_frame_to_buffer(frame)
+                        else:
+                            self.process_frame(frame)
                         
                         # When we get a frame, update counters for countdown
                         if self.countdown_active:
@@ -2057,9 +2125,56 @@ class CameraGUI(tk.Tk):
         
         self.after(20, self.update_frame_display)
 
+    def add_frame_to_buffer(self, frame):
+        """Add frame to buffer and compute sum/average if ready"""
+        try:
+            # Add frame to circular buffer
+            self.frame_buffer.append(frame.copy())
+            
+            # Update status
+            buffer_size = len(self.frame_buffer)
+            target_size = self.frame_sum_count.get()
+            self.sum_status_label.config(text=f"Summing: {buffer_size}/{target_size}")
+            
+            # Compute and display summed frame
+            if buffer_size >= min(2, target_size):  # Start displaying after at least 2 frames
+                self.compute_summed_frame()
+                
+        except Exception as e:
+            logging.error(f"Error adding frame to buffer: {e}")
+
+    def compute_summed_frame(self):
+        """Compute the summed/averaged frame from buffer"""
+        try:
+            if len(self.frame_buffer) == 0:
+                return
+            
+            mode = self.sum_mode_var.get()
+            frames_array = np.array(list(self.frame_buffer))
+            
+            if mode == "Average":
+                # Compute mean with float precision
+                self.summed_frame = np.mean(frames_array, axis=0)
+            elif mode == "Sum":
+                # Sum frames (watch for overflow)
+                self.summed_frame = np.sum(frames_array, axis=0, dtype=np.float64)
+            elif mode == "Median":
+                # Compute median (good for removing cosmic rays)
+                self.summed_frame = np.median(frames_array, axis=0)
+            
+            self.frames_in_sum = len(self.frame_buffer)
+            
+            # Display the summed frame
+            self.process_frame(self.summed_frame)
+            
+        except Exception as e:
+            logging.error(f"Error computing summed frame: {e}")
+
     def refresh_frame_display(self, *_):
         """Refresh the frame display"""
-        if self.last_frame is not None:
+        if self.frame_sum_enabled.get() and self.summed_frame is not None:
+            self.process_frame(self.summed_frame)
+        elif self.last_frame is not None:
             self.process_frame(self.last_frame)
 
     
@@ -2114,7 +2229,7 @@ class CameraGUI(tk.Tk):
         return int(zmin), int(zmax)
 
     def process_frame(self, data):
-        """Process and display a frame with auto-scaling support"""
+        """Process and display a frame with auto-scaling support and summing info"""
         if not self.display_lock.acquire(blocking=False):
             return
             
@@ -2142,13 +2257,27 @@ class CameraGUI(tk.Tk):
             scaled_data = np.clip((data.astype(np.float32) - min_val) / (max_val - min_val) * 255, 0, 255).astype(np.uint8)
 
             # Flip horizontally
-            scaled_data = cv2.flip(scaled_data, 1)
+            # Commenting now because qCMOS is on folded arm
+            # scaled_data = cv2.flip(scaled_data, 1)
             
             # Convert to BGR
             if len(scaled_data.shape) == 2:
                 scaled_data_bgr = cv2.cvtColor(scaled_data, cv2.COLOR_GRAY2BGR)
             else:
                 scaled_data_bgr = scaled_data
+
+            # Add text overlay if summing is active
+            if self.frame_sum_enabled.get() and self.frames_in_sum > 0:
+                mode = self.sum_mode_var.get()
+                text = f"{mode}: {self.frames_in_sum} frames"
+                cv2.putText(scaled_data_bgr, text, (10, 30), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+                
+                # Show statistics
+                if isinstance(data, np.ndarray):
+                    stats_text = f"Mean: {np.mean(data):.1f} | Std: {np.std(data):.1f}"
+                    cv2.putText(scaled_data_bgr, stats_text, (10, 60),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 1)
 
             # Draw any overlays
             if hasattr(self, 'circle_center'):
@@ -2209,10 +2338,9 @@ class CameraGUI(tk.Tk):
     def update_batch_size(self, *_):
         """Update batch size for saving"""
         try:
-            self.cube_size_var = int(self.cube_size_entry.get())
-            debug_logger.info(f"Batch size: {self.cube_size_var}")
+            debug_logger.info(f"Batch size: {self.cube_size_var.get()}")
         except:
-            self.cube_size_var = 100
+            self.cube_size_var.set(100)
 
     def change_binning(self, selected_binning):
         """Change camera binning"""
@@ -2277,7 +2405,10 @@ class CameraGUI(tk.Tk):
         
         try:
             for param, var in self.subarray_vars.items():
-                value = float(round(float(var.get()) / 4) * 4)
+                try:
+                    value = float(round(float(var.get()) / 4) * 4)
+                except tk.TclError:
+                    continue
                 self.camera_thread.set_property(f'SUBARRAY_{param}', value)
         except ValueError:
             debug_logger.error("Invalid subarray parameters")
@@ -2303,9 +2434,47 @@ class CameraGUI(tk.Tk):
         except ValueError:
             debug_logger.error("Invalid frames per bundle")
 
+    def toggle_frame_summing(self):
+        """Toggle frame summing on/off"""
+        if self.frame_sum_enabled.get():
+            # Clear buffer when enabling
+            self.frame_buffer.clear()
+            self.summed_frame = None
+            self.frames_in_sum = 0
+            self.sum_status_label.config(text="Summing: 0/{}".format(self.frame_sum_count.get()))
+            logging.info(f"Frame summing enabled: {self.frame_sum_count.get()} frames, mode: {self.sum_mode_var.get()}")
+        else:
+            # Clear buffer and display last single frame if available
+            self.sum_status_label.config(text="")
+            if self.last_frame is not None:
+                self.process_frame(self.last_frame)
+            logging.info("Frame summing disabled")
+
+    def update_sum_count(self):
+        """Update the number of frames to sum"""
+        if self.frame_sum_enabled.get():
+            # Clear buffer when changing count
+            self.frame_buffer.clear()
+            self.summed_frame = None
+            self.frames_in_sum = 0
+            self.sum_status_label.config(text="Summing: 0/{}".format(self.frame_sum_count.get()))
+
+    def update_sum_mode(self, *_):
+        """Update summing mode (average, sum, median)"""
+        if self.frame_sum_enabled.get():
+            # Reprocess with new mode
+            if len(self.frame_buffer) > 0:
+                self.compute_summed_frame()
+
     def start_capture(self):
         """Start camera capture"""
         try:
+            if self.frame_sum_enabled.get():
+                self.frame_buffer.clear()
+                self.summed_frame = None
+                self.frames_in_sum = 0
+                self.sum_status_label.config(text="Summing: 0/{}".format(self.frame_sum_count.get()))
+                
             if getattr(self.camera_thread, 'needs_reconnect', False):
                 self.update_status("Camera needs reset - use Reset Camera button", "red")
                 messagebox.showerror("Camera Error", 
@@ -2395,7 +2564,8 @@ class CameraGUI(tk.Tk):
             self.start_button, self.reset_button, self.binning_menu,
             self.bit_depth_menu, self.readout_speed_menu, self.sensor_mode_menu,
             self.subarray_mode_menu, self.framebundle_checkbox, 
-            self.frames_per_bundle_entry
+            self.frames_per_bundle_entry, self.power_cycle_button,
+            self.take_darks_button, self.take_flats_button
         ]
         
         for widget in controls:
@@ -2412,7 +2582,8 @@ class CameraGUI(tk.Tk):
             self.start_button, self.reset_button, self.binning_menu,
             self.bit_depth_menu, self.readout_speed_menu, self.sensor_mode_menu,
             self.subarray_mode_menu, self.framebundle_checkbox,
-            self.frames_per_bundle_entry
+            self.frames_per_bundle_entry, self.power_cycle_button,
+            self.take_darks_button, self.take_flats_button
         ]
         
         for widget in controls:
@@ -2432,202 +2603,272 @@ class CameraGUI(tk.Tk):
         except Exception as e:
             logging.error(f"Power cycle error: {e}")
 
+    def take_biases(self):
+        def _take_biases():
+            logging.info("Taking 50 biases at minimum exposure")
+            self.shutter_var.set('Closed')
+            self.update_shutter()
+            time.sleep(0.5)
+
+            self.save_data_var.set(True)
+            self.object_name_entry.delete(0, tk.END)
+            self.object_name_entry.insert(0, "bias")
+            self.camera_thread.set_property('EXPOSURE_TIME', 0)
+            # Clear queues before starting
+            while not self.frame_queue.empty():
+                self.frame_queue.get_nowait()
+            
+            # Start capture
+            self.camera_thread.save_queue = None
+            self.start_capture()
+            for i in range(50):
+                self.frame_queue.get(timeout=0.1)
+                if i % 10 == 9:
+                    logging.info(f"Bias {i+1}/50 captured")
+            self.stop_capture()
+            
+            time.sleep(1.0)
+            self.shutter_var.set('Open')
+            self.update_shutter()
+        threading.Thread(target=_take_biases, daemon=True).start()
+
+    def take_darks(self):
+        """Take a series of dark frames with shutter closed"""
+        def _take_darks():
+            logging.info("Taking 5 darks at 10s exposure")
+            # Close the shutter
+            self.shutter_var.set('Closed')
+            self.update_shutter()
+            time.sleep(0.5)
+
+            self.save_data_var.set(True)
+            self.object_name_entry.delete(0, tk.END)
+            self.object_name_entry.insert(0, "dark_10000_ms")
+            self.camera_thread.set_property('EXPOSURE_TIME', 10)
+            
+            # Clear queues before starting
+            while not self.frame_queue.empty():
+                self.frame_queue.get_nowait()
+            
+            # Start capture
+            self.camera_thread.save_queue = None
+            self.start_capture()
+            for i in range(5):
+                self.frame_queue.get(timeout=15.0)
+                logging.info(f"Dark {i+1}/5 captured")
+            self.stop_capture()
+            
+            time.sleep(1.0)
+            self.shutter_var.set('Open')
+            self.update_shutter()
+        threading.Thread(target=_take_darks, daemon=True).start()
+
     def take_flats(self):
         """Take flat field images cycling through filters with telescope offsets"""
-        def _cycle_filters():
-            try:
-                # Store original settings
-                original_exposure = self.exposure_time_var.get()
-                original_save_state = self.save_data_var.get()
-                original_object_name = self.object_name_entry.get()
-                
-                TARGET_MEAN = 40000
-                BIAS_LEVEL = 200
-                
-                # Define offset pattern for 6 frames (in arcseconds)
-                offset_pattern = [
-                    (0, 0),      # Frame 1: original position
-                    (5, 0),      # Frame 2: +5" RA
-                    (5, 5),      # Frame 3: +5" RA, +5" Dec  
-                    (0, 5),      # Frame 4: 0 RA, +5" Dec
-                    (-5, 5),     # Frame 5: -5" RA, +5" Dec
-                    (-5, 0),     # Frame 6: -5" RA, 0 Dec
-                ]
-                
-                # Test if TCS accepts commands with a small test offset
-                tcs_commands_work = False
-                if hasattr(self, 'tcs_thread') and self.tcs_thread:
-                    logging.info("Testing TCS command capability...")
-                    # Try a tiny offset and immediately reverse it
-                    test_success = self.tcs_thread.send_offset(0.1, 0)
-                    if test_success:
-                        # Reverse the test offset
-                        reverse_success = self.tcs_thread.send_offset(-0.1, 0)
-                        if reverse_success:
-                            tcs_commands_work = True
-                            logging.info("TCS accepts commands - will use offsets for flats")
-                            self.after(0, lambda: self.update_status("TCS working - using offsets for flats", "green"))
-                        else:
-                            logging.warning("TCS accepted test offset but failed to reverse - commands unreliable")
-                            self.after(0, lambda: self.update_status("TCS commands unreliable - flats at single position", "orange"))
+        def _take_flats():
+            # try:
+            # Store original settings
+            original_exposure = self.exposure_time_var.get()
+            original_save_state = self.save_data_var.get()
+            original_object_name = self.object_name_entry.get()
+            
+            TARGET_MEAN = 40000
+            BIAS_LEVEL = 200
+            
+            # Define offset pattern for 6 frames (in arcseconds)
+            offset_pattern = [
+                (0, 0),      # Frame 1: original position
+                (5, 0),      # Frame 2: +5" RA
+                (5, 5),      # Frame 3: +5" RA, +5" Dec  
+                (0, 5),      # Frame 4: 0 RA, +5" Dec
+                (-5, 5),     # Frame 5: -5" RA, +5" Dec
+                (-5, 0),     # Frame 6: -5" RA, 0 Dec
+            ]
+            
+            # Test if TCS accepts commands with a small test offset
+            tcs_commands_work = False
+            if hasattr(self, 'tcs_thread') and self.tcs_thread:
+                logging.info("Testing TCS command capability...")
+                # Try a tiny offset and immediately reverse it
+                test_success = self.tcs_thread.send_offset(0.1, 0)
+                if test_success:
+                    # Reverse the test offset
+                    reverse_success = self.tcs_thread.send_offset(-0.1, 0)
+                    if reverse_success:
+                        tcs_commands_work = True
+                        logging.info("TCS accepts commands - will use offsets for flats")
+                        self.after(0, lambda: self.update_status("TCS working - using offsets for flats", "green"))
                     else:
-                        logging.warning("TCS does not accept commands - will take all flats at current position")
-                        self.after(0, lambda: self.update_status("TCS commands disabled - flats at single position", "orange"))
+                        logging.warning("TCS accepted test offset but failed to reverse - commands unreliable")
+                        self.after(0, lambda: self.update_status("TCS commands unreliable - flats at single position", "orange"))
                 else:
-                    logging.warning("TCS not available - will take all flats at current position")
-                    self.after(0, lambda: self.update_status("TCS unavailable - flats at single position", "orange"))
-                
-                for filter_pos in [6, 1, 2, 3, 4, 5]:
-                    # Set filter
-                    filter_name = next((k for k, v in self.filter_options.items() if v == filter_pos), None)
-                    self.filter_position_var.set(filter_name)
-                    logging.info(f"Taking flats for filter {filter_name}")
-                    self.peripherals_thread.efw.SetPosition(0, filter_pos)
-                    self.peripherals_thread.efw.GetPosition(0)
-                    time.sleep(0.5)
-                    
-                    # Find appropriate test exposure
-                    test_exposure = 0.1  # Start at 100ms
-                    test_mean = 70000
-                    
-                    while test_mean > 60000 or test_mean < 1000:
-                        self.camera_thread.set_property('EXPOSURE_TIME', test_exposure)
-                        while not self.frame_queue.empty():
-                            self.frame_queue.get_nowait()
-                        
-                        self.camera_thread.start_capture()
-                        test_frame = self.frame_queue.get(timeout=2.0)
-                        self.camera_thread.stop_capture()
-                        
-                        # Calculate mean of central 100x100 region
-                        h, w = test_frame.shape
-                        cy, cx = h // 2, w // 2
-                        central_region = test_frame[cy-50:cy+50, cx-50:cx+50]
-                        test_mean = np.mean(central_region)
-                        
-                        if test_mean > 60000:
-                            test_exposure *= 0.1
-                            print(f"{filter_name}: Saturated (mean={test_mean:.0f}), trying {test_exposure*1000:.1f}ms")
-                        elif test_mean < 1000:
-                            test_exposure *= 5.0
-                            print(f"{filter_name}: Too low (mean={test_mean:.0f}), trying {test_exposure*1000:.1f}ms")  
-                    
-                    # Calculate scaled exposure
-                    scaled_exposure = test_exposure * (TARGET_MEAN - BIAS_LEVEL) / (test_mean - BIAS_LEVEL)
-                    scaled_exposure = max(0.001, min(30, scaled_exposure))
+                    logging.warning("TCS does not accept commands - will take all flats at current position")
+                    self.after(0, lambda: self.update_status("TCS commands disabled - flats at single position", "orange"))
+            else:
+                logging.warning("TCS not available - will take all flats at current position")
+                self.after(0, lambda: self.update_status("TCS unavailable - flats at single position", "orange"))
+            
+            filter_positions = self.flat_filter_pos_entry.get().strip().split(',')
+            if len(filter_positions) == 1 and filter_positions[0] == '':
+                filter_positions = ['6', '1', '2', '3', '4', '5']
 
-                    print(f"{filter_name}: test={test_mean:.0f} @ {test_exposure*1000:.1f}ms, scaled={scaled_exposure*1000:.0f}ms")
-                    
-                    # Prepare for capture
-                    self.save_data_var.set(True)
-                    filter_short = filter_name.split()[0].replace('(', '').replace(')', '')
-                    self.object_name_entry.delete(0, tk.END)
-                    self.object_name_entry.insert(0, f"flat_{filter_short}_{int(scaled_exposure*1000)}ms")
-                    
-                    self.camera_thread.set_property('EXPOSURE_TIME', scaled_exposure)
-                    
-                    # Clear queues before starting
+            for filter_pos in filter_positions:
+                filter_pos = int(filter_pos)
+                filter_name = next((k for k, v in self.filter_options.items() if v == filter_pos), None)
+                self.filter_position_var.set(filter_name)
+                logging.info(f"Taking flats for filter {filter_name}")
+                self.peripherals_thread.efw.SetPosition(0, filter_pos)
+                self.peripherals_thread.efw.GetPosition(0)
+                time.sleep(0.5)
+                
+                # Find appropriate test exposure
+                test_exposure = 0.1  # Start at 100ms
+                test_mean = 70000
+                
+                while test_mean > 60000 or test_mean < 1000:
+                    self.camera_thread.set_property('EXPOSURE_TIME', test_exposure)
                     while not self.frame_queue.empty():
                         self.frame_queue.get_nowait()
                     
-                    # Start capture
-                    self.camera_thread.save_queue = None
-                    self.camera_thread.start_capture()
+                    self.start_capture()
+                    test_frame = self.frame_queue.get(timeout=test_exposure*1000 + 2)
+                    self.stop_capture()
                     
-                    # Collect exactly 6 frames
-                    frames_to_save = []
-                    timestamps_to_save = []
-                    framestamps_to_save = []
-                    actual_ra_offset = 0
-                    actual_dec_offset = 0
+                    # Calculate mean of central 100x100 region
+                    h, w = test_frame.shape
+                    cy, cx = h // 2, w // 2
+                    central_region = test_frame[cy-50:cy+50, cx-50:cx+50]
+                    test_mean = np.mean(central_region)
                     
-                    for i in range(6):
-                        # Only attempt offsets if we confirmed TCS accepts commands
-                        if i > 0 and tcs_commands_work:
-                            ra_offset = offset_pattern[i][0] - offset_pattern[i-1][0]
-                            dec_offset = offset_pattern[i][1] - offset_pattern[i-1][1]
-                            
-                            # Send telescope offset (we already know it should work)
-                            success = self.tcs_thread.send_offset(ra_offset, dec_offset)
-                            
-                            if success:
-                                actual_ra_offset = offset_pattern[i][0]
-                                actual_dec_offset = offset_pattern[i][1]
-                                logging.info(f"Flat frame {i+1}: moved to offset ({offset_pattern[i][0]}\", {offset_pattern[i][1]}\")")
-                                time.sleep(2.0)  # Wait for telescope to settle
-                            else:
-                                # Unexpected failure - disable further offset attempts
-                                logging.warning(f"Unexpected TCS offset failure for frame {i+1} - disabling offsets for remainder")
-                                tcs_commands_work = False
-                                time.sleep(0.5)
-                        elif i > 0 and not tcs_commands_work:
-                            # Log once per filter that we're not offsetting
-                            if i == 1:
-                                logging.info(f"Taking all {filter_name} flats at single position (TCS commands unavailable)")
-                        
-                        # Capture frame
-                        frame = self.frame_queue.get(timeout=scaled_exposure + 2)
-                        try:
-                            ts, fs = self.timestamp_queue.get_nowait()
-                            timestamps_to_save.append(ts)
-                            framestamps_to_save.append(fs)
-                        except:
-                            timestamps_to_save.append(0)
-                            framestamps_to_save.append(0)
-                        frames_to_save.append(frame)
-                        
-                        logging.info(f"Captured flat frame {i+1}/6 for {filter_name}")
-                    
-                    self.camera_thread.stop_capture()
-                    
-                    # Return to original position only if we moved and TCS still works
-                    if tcs_commands_work and (actual_ra_offset != 0 or actual_dec_offset != 0):
-                        return_ra = -actual_ra_offset
-                        return_dec = -actual_dec_offset
-                        success = self.tcs_thread.send_offset(return_ra, return_dec)
-                        if success:
-                            logging.info(f"Returned to original position for next filter")
-                        else:
-                            logging.warning("Failed to return to original position - may need manual correction")
-                            self.after(0, lambda: self.update_status(
-                                "Warning: Failed to return telescope to original position", "orange"))
-                            # Disable further offsets since return failed
-                            tcs_commands_work = False
-                        time.sleep(2.0)
-                    
-                    # Save the collected frames
-                    save_queue = queue.Queue(maxsize=50000)
-                    for i, frame in enumerate(frames_to_save):
-                        save_queue.put((frame, timestamps_to_save[i], framestamps_to_save[i]))
-                    
-                    save_thread = OptimizedSaveThread(save_queue, self.camera_thread, self.get_header_info(),
-                                                    self.object_name_entry.get(), self.shared_data)
-                    save_thread.batch_size = 6
-                    save_thread.start()
-                    
-                    time.sleep(2.0)
-                    save_thread.stop()
-                    save_thread.join(timeout=5)
-                    
-                    time.sleep(1.0)
+                    if test_mean > 60000:
+                        test_exposure *= 0.1
+                        logging.info(f"{filter_name}: Saturated (mean={test_mean:.0f}), trying {test_exposure*1000:.1f}ms")
+                    elif test_mean < 1000:
+                        if test_exposure * 5.0 > 30.0:
+                            logging.warning(f"{filter_name}: Too low (mean={test_mean:.0f}), taking 30s flats")
+                            break
+                        test_exposure *= 5.0
+                        logging.info(f"{filter_name}: Too low (mean={test_mean:.0f}), trying {test_exposure*1000:.1f}ms")
+
+                # Calculate scaled exposure
+                scaled_exposure = test_exposure * (TARGET_MEAN - BIAS_LEVEL) / (test_mean - BIAS_LEVEL)
+                scaled_exposure = max(0.001, min(30, scaled_exposure))
+
+                logging.info(f"{filter_name}: test={test_mean:.0f} @ {test_exposure*1000:.1f}ms, scaled={scaled_exposure*1000:.0f}ms")
                 
-                # Restore original settings
-                self.camera_thread.set_property('EXPOSURE_TIME', original_exposure / 1000.0)
-                self.save_data_var.set(original_save_state)
+                # Prepare for capture
+                self.save_data_var.set(True)
+                filter_short = filter_name.split()[0].replace('(', '').replace(')', '')
                 self.object_name_entry.delete(0, tk.END)
-                self.object_name_entry.insert(0, original_object_name)
+                self.object_name_entry.insert(0, f"flat_{filter_short}_{int(scaled_exposure*1000)}ms")
                 
-                self.after(0, lambda: self.update_status("Flat sequence complete", "green"))
+                self.camera_thread.set_property('EXPOSURE_TIME', scaled_exposure)
                 
-            except Exception as e:
-                logging.error(f"Take flats error: {e}")
-                self.after(0, lambda err=e: self.update_status(f"Error: {err}", "red"))
+                # Clear queues before starting
+                while not self.frame_queue.empty():
+                    self.frame_queue.get_nowait()
+                
+                # Start capture
+                self.camera_thread.save_queue = None
+                # Not using self.start_capture() to ensure telescope moves between frames
+                self.camera_thread.start_capture()
+                self.disable_controls_during_capture()
+                
+                # Collect exactly 6 frames
+                frames_to_save = []
+                timestamps_to_save = []
+                framestamps_to_save = []
+                actual_ra_offset = 0
+                actual_dec_offset = 0
+                
+                for i in range(6):
+                    # Only attempt offsets if we confirmed TCS accepts commands
+                    if i > 0 and tcs_commands_work:
+                        ra_offset = offset_pattern[i][0] - offset_pattern[i-1][0]
+                        dec_offset = offset_pattern[i][1] - offset_pattern[i-1][1]
+                        
+                        # Send telescope offset (we already know it should work)
+                        success = self.tcs_thread.send_offset(ra_offset, dec_offset)
+                        
+                        if success:
+                            actual_ra_offset = offset_pattern[i][0]
+                            actual_dec_offset = offset_pattern[i][1]
+                            logging.info(f"Flat frame {i+1}: moved to offset ({offset_pattern[i][0]}\", {offset_pattern[i][1]}\")")
+                            time.sleep(2.0)  # Wait for telescope to settle
+                        else:
+                            # Unexpected failure - disable further offset attempts
+                            logging.warning(f"Unexpected TCS offset failure for frame {i+1} - disabling offsets for remainder")
+                            tcs_commands_work = False
+                            time.sleep(0.5)
+                    elif i > 0 and not tcs_commands_work:
+                        # Log once per filter that we're not offsetting
+                        if i == 1:
+                            logging.info(f"Taking all {filter_name} flats at single position (TCS commands unavailable)")
+                    
+                    # Capture frame
+                    frame = self.frame_queue.get(timeout=scaled_exposure + 2)
+                    try:
+                        ts, fs = self.timestamp_queue.get_nowait()
+                        timestamps_to_save.append(ts)
+                        framestamps_to_save.append(fs)
+                    except:
+                        timestamps_to_save.append(0)
+                        framestamps_to_save.append(0)
+                    frames_to_save.append(frame)
+                    
+                    logging.info(f"Captured flat frame {i+1}/6 for {filter_name}")
+                
+                self.camera_thread.stop_capture()
+                self.enable_controls_after_capture()
+                
+                # Return to original position only if we moved and TCS still works
+                if tcs_commands_work and (actual_ra_offset != 0 or actual_dec_offset != 0):
+                    return_ra = -actual_ra_offset
+                    return_dec = -actual_dec_offset
+                    success = self.tcs_thread.send_offset(return_ra, return_dec)
+                    if success:
+                        logging.info(f"Returned to original position for next filter")
+                    else:
+                        logging.warning("Failed to return to original position - may need manual correction")
+                        self.after(0, lambda: self.update_status(
+                            "Warning: Failed to return telescope to original position", "orange"))
+                        # Disable further offsets since return failed
+                        tcs_commands_work = False
+                    time.sleep(2.0)
+                
+                # Save the collected frames
+                save_queue = queue.Queue(maxsize=50000)
+                for i, frame in enumerate(frames_to_save):
+                    save_queue.put((frame, timestamps_to_save[i], framestamps_to_save[i]))
+                
+                save_thread = OptimizedSaveThread(save_queue, self.camera_thread, self.get_header_info(),
+                                                self.object_name_entry.get(), self.shared_data)
+                save_thread.batch_size = 6
+                save_thread.start()
+                
+                time.sleep(2.0)
+                save_thread.stop()
+                save_thread.join(timeout=5)
+                
+                time.sleep(1.0)
+            
+            # Restore original settings
+            self.camera_thread.set_property('EXPOSURE_TIME', original_exposure / 1000.0)
+            self.save_data_var.set(original_save_state)
+            self.object_name_entry.delete(0, tk.END)
+            self.object_name_entry.insert(0, original_object_name)
+            
+            self.after(0, lambda: self.update_status("Flat sequence complete", "green"))
+                
+            # except Exception as e:
+            #     logging.error(f"Take flats error: {e}")
+            #     self.after(0, lambda err=e: self.update_status(f"Error: {err}", "red"))
         
         if self.camera_thread.capturing:
             self.update_status("Cannot take flats while capturing", "orange")
             return
         
-        threading.Thread(target=_cycle_filters, daemon=True).start()
+        threading.Thread(target=_take_flats, daemon=True).start()
 
     # Peripheral control methods - all unchanged
     def update_peripherals_status(self):
@@ -2705,7 +2946,6 @@ class CameraGUI(tk.Tk):
                 option = self.halpha_qwp_var.get()
                 positions = {'Halpha': 151.5, 'QWP': 23.15, 'Neither': 87.18}
                 with self.peripherals_thread.peripherals_lock:
-                    print(positions[option])
                     self.peripherals_thread.ax_b_3.move_absolute(
                         positions[option], Units.LENGTH_MILLIMETRES)
             except Exception as e:
@@ -2816,6 +3056,7 @@ class CameraGUI(tk.Tk):
                     current_pos = self.peripherals_thread.ax_b_1.get_position(Units.ANGLE_DEGREES)
                     new_position = current_pos + relative_position
                     self.peripherals_thread.ax_b_1.move_absolute(new_position, Units.ANGLE_DEGREES)
+                    self.peripherals_thread.focus_virtual_position += relative_position
                     
                 self.update_status(f"Focus moved {relative_position:+.1f}° (toward {'far focus' if relative_position > 0 else 'near focus'})", "green")
                 # Reset entry to 0 after movement
@@ -2953,12 +3194,22 @@ class CameraGUI(tk.Tk):
         header_info = {}
         
         # Instrument parameters
-        header_info['FILTER'] = self.filter_position_var.get()
-        header_info['SHUTTER'] = self.shutter_var.get()
-        header_info['SLIT'] = self.slit_position_var.get()
-        header_info['HALPHA'] = self.halpha_qwp_var.get()
-        header_info['POLSTAGE'] = self.wire_grid_var.get()
-        
+        header_info['FILTER'] = (self.filter_position_var.get(), 'Filter position')
+        header_info['SHUTTER'] = (self.shutter_var.get(), 'Shutter position')
+        header_info['SLIT'] = (self.slit_position_var.get(), 'Slit in beam?')
+        header_info['HALPHA'] = (self.halpha_qwp_var.get(), 'H-alpha/QWP in beam?')
+        header_info['POLSTAGE'] = (self.wire_grid_var.get(), 'Wire grid/WeDoWo in beam?')
+        header_info['ZREFSET'] = (self.peripherals_thread.zoom_reference_set, 'Zoom reference set?')
+        if self.peripherals_thread.zoom_reference_set:
+            header_info['ZOOMPOS'] = (self.peripherals_thread.zoom_virtual_position, 'Zoom pos (deg) 0=3x')
+        else:
+            header_info['ZOOMPOS'] = ('N/A', 'No zoom pos available')
+        header_info['FREFSET'] = (self.peripherals_thread.focus_reference_set, 'Focus reference set?')
+        if self.peripherals_thread.focus_reference_set:
+            header_info['FOCPOS'] = (self.peripherals_thread.focus_virtual_position, 'Focus pos (deg) 0=mech lim')
+        else:
+            header_info['FOCPOS'] = ('N/A', 'No focus pos available')
+
         # Get telescope parameters from TCS thread
         if hasattr(self, 'tcs_thread') and self.tcs_thread:
             tcs_data = self.tcs_thread.get_current_data()
@@ -2970,6 +3221,7 @@ class CameraGUI(tk.Tk):
             header_info['TELROT'] = (tcs_data.get('rotator_angle', 'N/A'), 'Rotator angle (degrees)')
             header_info['TELPA'] = (tcs_data.get('parallactic_angle', 'N/A'), 'Parallactic angle (degrees)')
             header_info['AIRMASS'] = (tcs_data.get('airmass', 'N/A'), 'Airmass')
+            header_info['ROTENC'] = (tcs_data.get('rotator_encoder_angle', 'N/A'), 'Rotator encoder angle (degrees)')
             header_info['TELEL'] = (tcs_data.get('elevation', 'N/A'), 'Telescope elevation (degrees)')
             header_info['TELAZ'] = (tcs_data.get('azimuth', 'N/A'), 'Telescope azimuth (degrees)')
             header_info['TELHA'] = (tcs_data.get('hour_angle', 'N/A'), 'Hour angle')

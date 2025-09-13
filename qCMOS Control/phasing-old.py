@@ -3,18 +3,18 @@ from scipy.signal import convolve
 import tkinter as tk
 from tkinter import Label, Entry, Button, Scale, LabelFrame, Checkbutton
 import threading
-import datetime
 from astropy.time import Time
 import cv2
 import queue
 import time
-import os
 from astropy.io import fits
+
 
 LC_WINDOW_SIZE = (550, 300)
 LC_LEFT_BOUND = 50 # left bound of the plot
 LC_LOWER_BOUND = LC_WINDOW_SIZE[1]-40 # Lower bound of the plot
 STRETCH_SEVERITY=10
+IMAGE_BOTTOM_BUFFER=50
 
 def show_span(image, r, color):
     plot_width = LC_WINDOW_SIZE[0] - LC_LEFT_BOUND
@@ -140,7 +140,6 @@ class PhaseGUI(tk.Tk):
         self.timestamp_queue = timestamp_queue
         self.roi_moved = None
         self.ranges_moved = None
-        self.last_timestamp = None
 
         self.roi_center = None # Center of the ROI (pix)
         self.roi_width = None # Full width of the square ROI (pix)
@@ -162,7 +161,7 @@ class PhaseGUI(tk.Tk):
 
         # Set up GUI main frame
         self.title("Lightspeed Phasing GUI")
-        self.geometry("350x520")  # Adjust window size to tighten the layout
+        self.geometry("350x500")  # Adjust window size to tighten the layout
         self.main_frame = tk.Frame(self)
         self.main_frame.pack(expand=True, fill='both', padx=10, pady=10)
         self.main_frame.grid_columnconfigure(0, weight=1)
@@ -175,16 +174,14 @@ class PhaseGUI(tk.Tk):
 
         Label(ephemeris_frame, text="PEPOCH (MJD):").grid(row=0, column=0)
         self.pepoch_var = tk.DoubleVar()
-        self.pepoch_var.set(60930)
+        self.pepoch_var.set(60629)
         self.pepoch_var.trace_add("write", lambda *_: self.clear_data())
         self.pepoch_entry = Entry(ephemeris_frame, textvariable=self.pepoch_var)
         self.pepoch_entry.grid(row=0, column=1)
 
         Label(ephemeris_frame, text="Frequency (Hz):").grid(row=1, column=0)
         self.freq_var = tk.DoubleVar()
-        # self.freq_var.set(29.5483) # Crab
-        # self.freq_var.set(29.545715652039586) # Crab
-        self.freq_var.set(19.616733064469113) # B0540
+        self.freq_var.set(29.5552429346)
         self.freq_var.trace_add("write", lambda *_: self.clear_data())
         self.freq_entry = Entry(ephemeris_frame, textvariable=self.freq_var)
         self.freq_entry.grid(row=1, column=1)
@@ -200,9 +197,9 @@ class PhaseGUI(tk.Tk):
         self.n_bin_entry = Entry(lc_params_frame, textvariable=self.n_bin_var)
         self.n_bin_entry.grid(row=0, column=1)
 
-        Label(lc_params_frame, text="# Buffer size:").grid(row=1, column=0)
-        self.buffer_size_var = tk.IntVar()
-        self.buffer_size_var.set(500)
+        Label(lc_params_frame, text="# Buffer size (s):").grid(row=1, column=0)
+        self.buffer_size_var = tk.DoubleVar()
+        self.buffer_size_var.set(0.5)
         self.buffer_size_var.trace_add("write", lambda *_: self.extend_buffers())
         self.buffer_size_entry = Entry(lc_params_frame, textvariable=self.buffer_size_var)
         self.buffer_size_entry.grid(row=1, column=1)
@@ -219,27 +216,20 @@ class PhaseGUI(tk.Tk):
         self.lock_roi_var.set(0)
         self.lock_roi_button = Checkbutton(lc_params_frame, variable=self.lock_roi_var, onvalue=1, offvalue=0)
         self.lock_roi_button.grid(row=3, column=1)
-        self.width_entry.grid(row=2, column=1)
 
-        Label(lc_params_frame, text="Use circular ROI:").grid(row=4, column=0)
-        self.circular_roi_var = tk.IntVar()
-        self.circular_roi_var.set(0)
-        self.circular_roi_button = Checkbutton(lc_params_frame, variable=self.circular_roi_var, onvalue=1, offvalue=0)
-        self.circular_roi_button.grid(row=4, column=1)
-
-        Label(lc_params_frame, text="Blur:").grid(row=5, column=0)
+        Label(lc_params_frame, text="Blur:").grid(row=4, column=0)
         self.blur_var = tk.DoubleVar()
         self.blur_var.set(0)
         self.blur_scale = Scale(lc_params_frame, from_=0, to_=6, resolution=0.1, length=150, variable=self.blur_var, orient=tk.HORIZONTAL)
-        self.blur_scale.grid(row=5, column=1)
+        self.blur_scale.grid(row=4, column=1)
 
         self.reset_image_button = Button(lc_params_frame, text="Reset images", command=self.clear_image)
-        self.reset_image_button.grid(row=6, column=0)
+        self.reset_image_button.grid(row=5, column=0)
         self.reset_lc_button = Button(lc_params_frame, text="Reset lightcurve", command=self.clear_lc)
-        self.reset_lc_button.grid(row=6, column=1)
+        self.reset_lc_button.grid(row=5, column=1)
 
         self.status_message = tk.Label(lc_params_frame, text="Initialized", justify=tk.LEFT, anchor="w", width=30)
-        self.status_message.grid(row=7, column=0, columnspan=2, sticky='nsew')
+        self.status_message.grid(row=6, column=0, columnspan=2, sticky='nsew')
 
         # Instructions
         lc_params_frame = LabelFrame(self.main_frame, text="Instructions", padx=5, pady=5)
@@ -249,13 +239,14 @@ class PhaseGUI(tk.Tk):
         Label(lc_params_frame, text="Then click and drag in the LC to set \"on\" range").grid(row=2, column=0)
         Label(lc_params_frame, text="Hold shift & click and drag to set the \"off\" range").grid(row=3, column=0)
         Label(lc_params_frame, text="The bottom image shows on minus off").grid(row=4, column=0)
-        Label(lc_params_frame, text="You can also right-click to place a circle").grid(row=5, column=0)
 
         # Initialize data
         if type(feed) is SavedDataThread:
             self.set_camera_data_from_file(feed)
+        # elif type(feed) is CameraThread:
+        #     self.set_camera_data_from_camera_thread(feed)
         else:
-            self.set_camera_data_from_camera_gui(feed)
+            raise Exception(f"Feed of type {type(feed)} is not supported")
         
         self.clear_data()
         self.update_frame_display()
@@ -264,43 +255,34 @@ class PhaseGUI(tk.Tk):
         cv2.destroyAllWindows()
         self.destroy()
 
-    def set_camera_data_from_camera_gui(self, camera_gui):
+    def set_camera_data_from_camera_thread(self, camera_thread):
         """
         Set the camera feed metadata based on the camera thread
         """
-        self.t_start = 2e8# GPS time of the first frame of this data set
-        self.n_framebundle = camera_gui.batch_size # TODO check that this is right. # Number of stacked images per frame
-        self.image_shape = (3200//self.n_framebundle,512)# TODO check that this is right. # Shape of each image
+        raise NotImplementedError()
+    
+        # self.t_start = 
+        # self.n_stacks = 
+        # self.delta_t = 
+        # self.image_shape = 
 
     def set_camera_data_from_file(self, saved_data_feed):
         """
         Set the camera feed metadata based on a file's header
         """
-        with fits.open(saved_data_feed.start_filename) as hdul:
+        with fits.open(saved_data_feed.filename) as hdul:
             # Get the start time of the observation in MJD
-            try:
-                start_time = hdul[0].header["GPSSTART"]
-                mjd = Time(start_time).jd - 2400000.5
-            except:
-                mjd = 0
+            # start_time = hdul[0].header["GPSSTART"]
+            start_time = "2025-09-12T09:17:55.959230423"
+            # mjd = start_time / 86400
+            mjd = Time(start_time).jd - 2400000.5
+            delta_time_stamp = hdul[2].data["TIMESTAMP"][1] - hdul[2].data["TIMESTAMP"][0]
             frame_shape = hdul[1].data[0].shape
-            try:
-                self.n_framebundle = int(hdul[1].header["HIERARCH FRAMEBUNDLE NUMBER"])
-            except:
-                self.n_framebundle = 100
 
         self.t_start = mjd * 3600 * 24 # Time at which the camera started observing (seconds)
-        self.image_shape = (frame_shape[0]//self.n_framebundle, frame_shape[1])
-
-    def update_batch_size(self, batch_size):
-        self.n_framebundle = batch_size # TODO check that this is right.
-        self.image_shape = (3200//self.n_framebundle,512) # TODO check that this is right.
-        self.on_image = None
-        self.off_image = None
-        self.clear_image()
-
-    def update_start_time(self, start_time):
-        self.t_start = start_time
+        self.n_stacks = 10 # TODO Number of stacked images in a given frame
+        self.delta_t = delta_time_stamp / self.n_stacks # Time between stacked images
+        self.image_shape = (frame_shape[0]//self.n_stacks, frame_shape[1])
 
     def on_event_image(self, event, x, y, flags, param):
         left_down = (flags & cv2.EVENT_FLAG_LBUTTON)!=0
@@ -309,13 +291,13 @@ class PhaseGUI(tk.Tk):
             if control_down:
                 self.stretch = [
                     (x/(self.image_shape[1])),
-                    1-(y/(self.image_shape[0]*3+1+10))
+                    1-(y/(self.image_shape[0]*2+1+IMAGE_BOTTOM_BUFFER))
                 ]
             else:
                 # Place ROI
                 if y >= 0:
                     self.roi_moved = (x, y % self.image_shape[0])
-        elif event == cv2.EVENT_RBUTTONDOWN and not control_down:
+        elif event == cv2.EVENT_RBUTTONDOWN:
             # Place marker
             self.marker = (x, y % self.image_shape[0])
 
@@ -351,7 +333,10 @@ class PhaseGUI(tk.Tk):
         self.off_image.extend(buffer_frame_size)
 
     def get_buffer_size(self):
-        buffer_frame_limit = get_tk_value(self.buffer_size_var)
+        buffer_time_limit = get_tk_value(self.buffer_size_var)
+        if np.isnan(buffer_time_limit):
+            return 1
+        buffer_frame_limit = int(np.round(buffer_time_limit / self.delta_t))
         return max(buffer_frame_limit, 1)
 
     def get_phase(self, timestamp):
@@ -359,8 +344,7 @@ class PhaseGUI(tk.Tk):
         Get the phase of an event with the provided ephemeris and timestamp
         """
         pepoch = get_tk_value(self.pepoch_var)
-        freq = get_tk_value(self.freq_var)
-        if freq <= 0 or np.isnan(freq): return 1e-5
+        freq  =get_tk_value(self.freq_var)
         delta_time = self.t_start + timestamp - pepoch * 3600 * 24
         phase = delta_time * freq
         phase -= np.floor(phase)
@@ -396,22 +380,15 @@ class PhaseGUI(tk.Tk):
     def make_roi_mask(self):
         xs, ys = np.meshgrid(np.arange(self.image_shape[1]), np.arange(self.image_shape[0]))
         width = get_tk_value(self.width_var)
-        if get_tk_value(self.circular_roi_var) == 0:
-            # Square ROI
-            self.roi_mask = np.abs(xs - self.roi_center[0]) <= width//2
-            self.roi_mask &= np.abs(ys - self.roi_center[1]) <= width//2
-        else:
-            # Circular ROI
-            dists = np.sqrt((xs - self.roi_center[0])**2 + (ys - self.roi_center[1])**2)
-            self.roi_mask = dists <= width//2
-
+        self.roi_mask = np.abs(xs - self.roi_center[0]) <= width//2
+        self.roi_mask &= np.abs(ys - self.roi_center[1]) <= width//2
 
     def process_lc(self, data, timestamp):
         if self.roi_center is None:
             return
         
         # Get flux within ROI
-        flux = np.sum(data[self.roi_mask]) - 200 * np.sum(self.roi_mask)
+        flux = np.sum(data[self.roi_mask])
 
         # Add to the LC
         phase = self.get_phase(timestamp)
@@ -444,9 +421,8 @@ class PhaseGUI(tk.Tk):
         if np.mean(lc_fluxes) > 0:
             lc_errorbar /= np.mean(lc_fluxes)
             lc_fluxes /= np.mean(lc_fluxes)
-        lc_span = np.max(lc_fluxes) - np.min(lc_fluxes)
-        vmin = np.min(lc_fluxes) - lc_span*0.05
-        vmax = np.max(lc_fluxes) + lc_span*0.05 + 1e-5
+        vmin = 0.9*np.min(lc_fluxes)
+        vmax = 1.1*np.max(lc_fluxes) + 1e-5
 
         image = np.zeros((LC_WINDOW_SIZE[1], LC_WINDOW_SIZE[0], 3), np.uint8)
 
@@ -469,10 +445,7 @@ class PhaseGUI(tk.Tk):
 
             # Show errorbar
             mid_x = (start_x + end_x) // 2
-            try:
-                barh = int(np.round(LC_LOWER_BOUND * lc_errorbar[i] / (vmax - vmin)))
-            except:
-                barh = 0
+            barh = int(np.round(LC_LOWER_BOUND * lc_errorbar[i] / (vmax - vmin)))
             cv2.line(image, (mid_x, y+barh), (mid_x, y-barh), (255, 255, 255))
         hist_pts = np.array(hist_pts, np.int32).reshape(-1,1,2)
         cv2.polylines(image, [hist_pts], False, (255, 255, 255), 2)
@@ -522,7 +495,7 @@ class PhaseGUI(tk.Tk):
                 scaled_image = convolve(scaled_image, gauss, mode="same")
 
         # Stretch
-        scaled_image = np.exp(STRETCH_SEVERITY*(0.5-self.stretch[1])) * (scaled_image - self.stretch[0]) + self.stretch[0]
+        scaled_image = np.exp(STRETCH_SEVERITY*(self.stretch[1]-0.5)) * (scaled_image - self.stretch[0]) + self.stretch[0]
 
         # Prepare for drawing
         scaled_image[~np.isfinite(scaled_image)] = 0
@@ -538,18 +511,10 @@ class PhaseGUI(tk.Tk):
             # Draw ROI
             if self.roi_center is not None:
                 width = get_tk_value(self.width_var)
-                if get_tk_value(self.circular_roi_var) == 0:
-                    # Square ROI
-                    cv2.rectangle(scaled_image,
-                        (self.roi_center[0]-width//2, self.roi_center[1]-width//2),
-                        (self.roi_center[0]+width//2, self.roi_center[1]+width//2),
-                        (0, 255, 0), 1)
-                else:
-                    # Circular ROI
-                    cv2.circle(scaled_image,
-                        (self.roi_center[0], self.roi_center[1]), width//2,
-                        (0, 255, 0), 1)
-                    
+                cv2.rectangle(scaled_image,
+                    (self.roi_center[0]-width//2, self.roi_center[1]-width//2),
+                    (self.roi_center[0]+width//2, self.roi_center[1]+width//2),
+                    (0, 255, 0), 1)
         return scaled_image
 
     def display_image(self):
@@ -561,7 +526,7 @@ class PhaseGUI(tk.Tk):
         total_image = self.total_image.get().astype(float)
         vmin = np.min(total_image)
         vmax = np.max(total_image)
-        merged_image = np.zeros((3*self.image_shape[0]+1+10, self.image_shape[1], 3), np.uint8)
+        merged_image = np.zeros((2*self.image_shape[0]+1+IMAGE_BOTTOM_BUFFER, self.image_shape[1], 3), np.uint8)
 
         stretched_total = self.apply_stretch(total_image, vmin, vmax)
         merged_image[:self.image_shape[0], :, :] = stretched_total
@@ -571,18 +536,15 @@ class PhaseGUI(tk.Tk):
             on_image = self.on_image.get().astype(float)
             off_image = self.off_image.get().astype(float)
             difference_image = on_image / get_phase_duration(self.on_range) - off_image / get_phase_duration(self.off_range)
-            vmin = np.min(difference_image)
-            vmax = np.max(difference_image)
             stretched_difference = self.apply_stretch(difference_image, vmin, vmax)
             merged_image[self.image_shape[0]+1:2*self.image_shape[0]+1,:, :] = stretched_difference
 
             if np.sum(on_image) == 0:
                 snr_metric = 0
             else:
-                mean_difference_image_flux = np.mean(difference_image[~self.roi_mask])
-                mean_roi_difference = np.mean(difference_image[self.roi_mask]) - mean_difference_image_flux
+                mean_roi_flux = np.sum(difference_image[self.roi_mask]) / np.sum(self.roi_mask)
                 variance_of_background = np.var(difference_image[~self.roi_mask])
-                snr_metric = mean_roi_difference**2 / variance_of_background
+                snr_metric = mean_roi_flux**2 / variance_of_background
 
         # Add the colorbar
         colorbar = np.zeros((10, self.image_shape[1]))
@@ -634,16 +596,11 @@ class PhaseGUI(tk.Tk):
         while not self.frame_queue.empty():
             frame = self.frame_queue.get_nowait()
             timestamp = self.timestamp_queue.get_nowait()
-            if self.last_timestamp is None:
-                self.last_timestamp = timestamp
-                continue
-            delta_t = (timestamp - self.last_timestamp) / self.n_framebundle # Time between slices
-            slice_width = frame.shape[0] // self.n_framebundle # Width of each slice in pixels
+            slice_width = frame.shape[0] // self.n_stacks # Width of each slice in pixels
             stripped_image = frame.reshape(-1, slice_width, frame.shape[1]).astype(np.uint32)
             for (strip_index, strip) in enumerate(stripped_image):
-                self.process_lc(strip, timestamp + strip_index*delta_t)
-                self.process_image(strip, timestamp + strip_index*delta_t)
-            self.last_timestamp = timestamp
+                self.process_lc(strip, timestamp + strip_index * self.delta_t)
+                self.process_image(strip, timestamp + strip_index * self.delta_t)
 
         # Display the data
         self.display_lc()
@@ -653,99 +610,52 @@ class PhaseGUI(tk.Tk):
         self.after(50, self.update_frame_display)  # About 20 FPS
 
 class SavedDataThread(threading.Thread):
-    def __init__(self, object_name, frame_queue, timestamp_queue, day_string=None, time_string=None, start_index=None):
+    def __init__(self, filename, frame_queue, timestamp_queue):
         """
-        Feed data from a saved file into the GUI.
-        # Arguments:
-        * object_name: the name of the object as reported in the data cube file name
-        * frame_queue: the frame queue
-        * timestamp_queue: the frame queue
-        * day_string: The dataset day as reported in the data cube file name. Set to None (default) to chose today
-        * time_string: The time of capture as reported in the data cube file name. Set to None (default) to chose the latest
-        * start_index: The data cube index. Set to None to chose 1.
+        Feed data from a saved file into the GUI
         """
         super().__init__()
         self.frame_queue = frame_queue
         self.timestamp_queue = timestamp_queue
-        #self.data_dir = "/data/Lightspeed/captures/observations_9_11"
-        self.data_dir = "/nvme-data/Lightspeed/captures_2025_09_12"
-
-        if day_string is None:
-            day_string = datetime.date.today().strftime("%Y%m%d")
-
-        if start_index is None:
-            start_index = 1
-
-        if time_string is None:
-            time_string = None
-            for f in os.listdir(self.data_dir):
-                if not f.startswith(f"{object_name}_{day_string}"):
-                    continue
-                if not f.endswith(f"cube{start_index:03d}.fits"):
-                    continue
-                this_file_time_string = f.split("_")[-2]
-
-                if time_string is None or int(this_file_time_string) > int(time_string):
-                    time_string = this_file_time_string
-        if time_string is None:
-            raise Exception(f"Could not find any cubes for object {object_name} at day {day_string} with index {start_index}")
-
-        self.object_name = object_name
-        self.day_string = day_string
-        self.time_string = time_string
-        self.start_index = start_index
-        self.start_filename = f"{self.data_dir}/{self.object_name}_{self.day_string}_{self.time_string}_cube{self.start_index:03d}.fits"
+        self.filename = filename
+        with fits.open(filename) as hdul:
+            self.frames = np.array(hdul[1].data)
+            self.timestamps = hdul[2].data["TIMESTAMP"]
+            self.framestamps = hdul[2].data["FRAMESTAMP"]
+        self.time_between_frames = self.timestamps[1] - self.timestamps[0]
 
     def run(self):
-        threading.Thread(target=self.submit_to_queue, daemon=True).start()
+        threading.Thread(target=self.load_file, daemon=True).start()
 
-    def submit_to_queue(self):
-        # Read in all files
-        for cube_index in range(self.start_index, 1_000_000):
-            filename = f"{self.data_dir}/{self.object_name}_{self.day_string}_{self.time_string}_cube{cube_index:03d}.fits"
-
-            # Check if filename exists
-            for _ in range(20):
-                if os.path.exists(filename):
-                    break
-                time.sleep(0.1)
-            if not os.path.exists(filename):
-                print(f"Could not find file {filename}. Feed stopped")
-                break
-
-            print(f"Loading file {filename}")
-            with fits.open(filename) as hdul:
-                frames = np.array(hdul[1].data)
-                timestamps = hdul[2].data["TIMESTAMP"]
-                framestamps = hdul[2].data["FRAMESTAMP"]
-
-            # Submit frames
-            start = time.time()
-            for frame, timestamp in zip(frames, timestamps):
-                desired_time = (timestamp - timestamps[0]) + start
-                time.sleep(max(desired_time - time.time(), 0)) # Sleep until the next frame is due
-                if self.frame_queue.full():
-                    self.frame_queue.get_nowait()
-                    self.timestamp_queue.get_nowait()
+    def load_file(self):
+        for (frame, timestamp) in zip(self.frames, self.timestamps):
+            # time.sleep(self.time_between_frames) # Use this line of code for a real run to deliver real-time data
+            time.sleep(0.5) # Use this line for debugging purposes, to make the data stream last longer.
+            try:
                 self.frame_queue.put_nowait(frame)
                 self.timestamp_queue.put_nowait(timestamp)
-            print("File completed")
+            except queue.Full:
+                self.frame_queue.get_nowait()
+                self.timestamp_queue.get_nowait()
+                self.frame_queue.put_nowait(frame)
+                self.timestamp_queue.put_nowait(timestamp)
+        print("File completed")
 
 if __name__ == "__main__":
     # Create shared queues containing the data coming from the camera / saved data.
-    QUEUE_MAXSIZE = 8
+    # The matplotlib lightcurve is really slow, so it's important to have a fairly large queue that can save many frames as the GUI plots the lightcurve. The frames will be dumped into the image buffer later.
+    QUEUE_MAXSIZE = 100
     frame_queue = queue.Queue(maxsize=QUEUE_MAXSIZE)
     timestamp_queue = queue.Queue(maxsize=QUEUE_MAXSIZE)
 
-    # Create the thread to feed the GUI data from a FITS file.
-    
-    # test_thread = SavedDataThread("crab1000", frame_queue, timestamp_queue, day_string="20241026", start_index=66)
-    test_thread = SavedDataThread("PSRB0540", frame_queue, timestamp_queue)
+    # Create the thread to feed the GUI data from a FITS file
+    test_thread = SavedDataThread("/home/lightspeed/Documents/Lightspeed-Control/captures/observations_9_11/crab_20250912_061905_cube060.fits", frame_queue, timestamp_queue)
     test_thread.start()
 
     # Create the gui
     phase_gui = PhaseGUI(frame_queue, timestamp_queue, test_thread)
 
     # Run the gui
+    phase_gui.camera_thread = test_thread
     phase_gui.protocol("WM_DELETE_WINDOW", phase_gui.on_close)
     phase_gui.mainloop()
