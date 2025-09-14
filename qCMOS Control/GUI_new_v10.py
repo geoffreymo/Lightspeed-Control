@@ -12,6 +12,7 @@ from astropy.io import fits
 from datetime import datetime
 from astropy.time import Time
 import os
+import json
 import warnings
 from PyZWOEFW import EFW
 import asyncio
@@ -160,10 +161,10 @@ class CameraThread(threading.Thread):
         self.first_frame = True
         self.buffer_size = 200
         self.save_queue = None
+        self.is_connected = False
         self.needs_reconnect = False
         
         # Performance monitoring
-        self.last_frame_time = time.time()
         self.frame_count = 0
         self.last_print_time = time.time()
         self.fps_calc_time = time.time()
@@ -218,6 +219,8 @@ class CameraThread(threading.Thread):
                 self.needs_reconnect = False
                 self.set_defaults()
                 self.update_camera_params()
+                self.is_connected = True
+                self.update_gui_status("Camera connected.", "green")
                 return True
                 
             except Exception as e:
@@ -237,7 +240,7 @@ class CameraThread(threading.Thread):
                 self.paused.wait(timeout=0.001)
                 
                 if self.needs_reconnect:
-                    self.update_gui_status("Camera needs reset - use Reset Camera button", "red")
+                    self.update_gui_status("Camera needs reset - use Reboot Camera button", "red")
                     time.sleep(1.0)
                     continue
                 
@@ -316,6 +319,7 @@ class CameraThread(threading.Thread):
         current_time = time.time()
         if current_time - self.last_print_time > 1.0:
             logging.info(f"Frame {self.frame_index}: timestamp={corrected_timestamp:.6f}, framestamp={corrected_framestamp}")
+            self.update_gui_status(f"Captured frame {self.frame_index}", "green")
             self.last_print_time = current_time
         
         # Update watchdog
@@ -427,7 +431,6 @@ class CameraThread(threading.Thread):
         self.frame_index = 0
         self.first_frame = True
         self.frame_count = 0
-        self.last_frame_time = time.time()
         self.last_capture_time = time.time()
         self.watchdog_enabled = True
         self.consecutive_errors = 0
@@ -1244,10 +1247,10 @@ class PeripheralsThread(threading.Thread):
                 new_position = current_pos + relative_degrees
                 self.ax_a_2.move_absolute(new_position, Units.ANGLE_DEGREES)
                 
-                # If this pushes the virtual position out of bounds,
-                # update the reference
-                if self.zoom_reference_set:
-                    self.zoom_virtual_position += relative_degrees
+                # Unset reference if moved manually
+                self.zoom_reference_set = False
+                self.zoom_reference_position = None
+                self.zoom_virtual_position = None
                     
             return True
         except Exception as e:
@@ -1306,12 +1309,6 @@ class PeripheralsThread(threading.Thread):
                 except Exception as e:
                     logging.error(f"Get outlet states error: {e}")
         return {}
-
-#!/usr/bin/env python3
-"""
-Fixed TCSThread class that properly handles TCS communication
-The TCS closes connections after each command, so we need to reconnect for each operation
-"""
 
 class TCSThread(threading.Thread):
     """Thread for communicating with the Telescope Control System"""
@@ -1547,6 +1544,129 @@ class TCSThread(threading.Thread):
         """Stop TCS thread"""
         self.running = False
 
+class SimpleConfigManager:
+    """Simple configuration manager that auto-saves and provides restore button"""
+    
+    def __init__(self, config_file="lightspeed_config.json"):
+        self.config_file = config_file
+    
+    def save_config(self, gui_instance):
+        """Save current GUI configuration automatically"""
+        try:
+            config = {
+                "exposure_time_ms": gui_instance.exposure_time_var.get(),
+                "binning": gui_instance.binning_var.get(),
+                "bit_depth": gui_instance.bit_depth_var.get(),
+                "readout_speed": gui_instance.readout_speed_var.get(),
+                "sensor_mode": gui_instance.sensor_mode_var.get(),
+                "subarray_mode": gui_instance.subarray_mode_var.get(),
+                "framebundle_enabled": gui_instance.framebundle_var.get(),
+                "frames_per_bundle": gui_instance.frames_per_bundle_var.get(),
+                "save_data": gui_instance.save_data_var.get(),
+                "object_name": gui_instance.object_name_entry.get(),
+                "frames_per_datacube": gui_instance.cube_size_var.get(),
+                "min_count": gui_instance.min_val.get(),
+                "max_count": gui_instance.max_val.get(),
+                "auto_minmax": gui_instance.auto_minmax_var.get(),
+                "auto_zscale": gui_instance.auto_zscale_var.get(),
+                "scaling_type": gui_instance.scaling_type_var.get(),
+                "frame_sum_enabled": gui_instance.frame_sum_enabled.get(),
+                "frame_sum_count": gui_instance.frame_sum_count.get(),
+                "frame_sum_mode": gui_instance.sum_mode_var.get(),
+                "filter_position": gui_instance.filter_position_var.get(),
+                "shutter_state": gui_instance.shutter_var.get(),
+                "slit_position": gui_instance.slit_position_var.get(),
+                "halpha_qwp_position": gui_instance.halpha_qwp_var.get(),
+                "pol_stage_position": gui_instance.wire_grid_var.get(),
+                "flat_filter_positions": gui_instance.flat_filter_pos_entry.get(),
+                "tcs_offset_amount": gui_instance.tcs_offset_amount.get() if hasattr(gui_instance, 'tcs_offset_amount') else 5.0
+            }
+            
+            # Add subarray parameters
+            for param in ["HPOS", "HSIZE", "VPOS", "VSIZE"]:
+                if param in gui_instance.subarray_vars:
+                    config[f"subarray_{param.lower()}"] = gui_instance.subarray_vars[param].get()
+            
+            with open(self.config_file, 'w') as f:
+                json.dump(config, f, indent=2)
+            
+            return True
+            
+        except Exception as e:
+            logging.error(f"Failed to save configuration: {e}")
+            return False
+    
+    def load_config(self, gui_instance):
+        """Load and apply saved configuration"""
+        try:
+            if not os.path.exists(self.config_file):
+                return False
+            
+            with open(self.config_file, 'r') as f:
+                config = json.load(f)
+            
+            # Apply settings
+            gui_instance.exposure_time_var.set(config.get("exposure_time_ms", 100))
+            gui_instance.binning_var.set(config.get("binning", "1x1"))
+            gui_instance.bit_depth_var.set(config.get("bit_depth", "16-bit"))
+            gui_instance.readout_speed_var.set(config.get("readout_speed", "Ultra Quiet Mode"))
+            gui_instance.sensor_mode_var.set(config.get("sensor_mode", "Standard"))
+            gui_instance.subarray_mode_var.set(config.get("subarray_mode", "Off"))
+            gui_instance.framebundle_var.set(config.get("framebundle_enabled", False))
+            gui_instance.frames_per_bundle_var.set(config.get("frames_per_bundle", 100))
+            
+            gui_instance.save_data_var.set(config.get("save_data", False))
+            gui_instance.object_name_entry.delete(0, tk.END)
+            gui_instance.object_name_entry.insert(0, config.get("object_name", ""))
+            gui_instance.cube_size_var.set(config.get("frames_per_datacube", 100))
+            
+            gui_instance.min_val.set(str(config.get("min_count", "0")))
+            gui_instance.max_val.set(str(config.get("max_count", "60000")))
+            gui_instance.auto_minmax_var.set(config.get("auto_minmax", False))
+            gui_instance.auto_zscale_var.set(config.get("auto_zscale", False))
+            gui_instance.scaling_type_var.set(config.get("scaling_type", "Linear"))
+            gui_instance.frame_sum_enabled.set(config.get("frame_sum_enabled", False))
+            gui_instance.frame_sum_count.set(config.get("frame_sum_count", 5))
+            gui_instance.sum_mode_var.set(config.get("frame_sum_mode", "Average"))
+            
+            gui_instance.filter_position_var.set(config.get("filter_position", "0 (Open)"))
+            gui_instance.shutter_var.set(config.get("shutter_state", "Open"))
+            gui_instance.slit_position_var.set(config.get("slit_position", "Out of beam"))
+            gui_instance.halpha_qwp_var.set(config.get("halpha_qwp_position", "Neither"))
+            gui_instance.wire_grid_var.set(config.get("pol_stage_position", "Neither"))
+            
+            gui_instance.flat_filter_pos_entry.delete(0, tk.END)
+            gui_instance.flat_filter_pos_entry.insert(0, config.get("flat_filter_positions", "6,1,2,3,4,5"))
+            
+            if hasattr(gui_instance, 'tcs_offset_amount'):
+                gui_instance.tcs_offset_amount.set(config.get("tcs_offset_amount", 5.0))
+            
+            # Apply subarray parameters
+            subarray_params = {
+                "HPOS": config.get("subarray_hpos", 0),
+                "HSIZE": config.get("subarray_hsize", 4096),
+                "VPOS": config.get("subarray_vpos", 0),
+                "VSIZE": config.get("subarray_vsize", 2304)
+            }
+            for param, value in subarray_params.items():
+                if param in gui_instance.subarray_vars:
+                    gui_instance.subarray_vars[param].set(value)
+            
+            # Update auto-scaling state
+            if config.get("auto_minmax", False):
+                gui_instance.toggle_auto_scaling('minmax')
+            elif config.get("auto_zscale", False):
+                gui_instance.toggle_auto_scaling('zscale')
+            
+            return True
+            
+        except Exception as e:
+            logging.error(f"Failed to load configuration: {e}")
+            return False
+    
+    def config_exists(self):
+        return os.path.exists(self.config_file)
+
 class CameraGUI(tk.Tk):
     """Main GUI application - keeping original layout exactly"""
     
@@ -1567,25 +1687,27 @@ class CameraGUI(tk.Tk):
         self.tcs_thread = TCSThread(gui_ref=self)
         self.tcs_thread.daemon = True
         self.tcs_thread.start()
-        self.countdown_active = False
         self.frame_count = 0
-        self.last_frame_time = None
         self.frame_sum_enabled = tk.BooleanVar(value=False)
         self.frame_sum_count = tk.IntVar(value=5)
         self.frame_buffer = deque(maxlen=50)  # Circular buffer for frames
         self.summed_frame = None
         self.frames_in_sum = 0
+        self.roi_selecting = False
+        self.roi_start_point = None
+        self.roi_end_point = None
+        self.roi_drawing = False
         
         # Performance monitoring
         self.last_fps_update = time.time()
         self.actual_display_count = 0
         self.last_display_time = time.time()
 
-        self.min_val = tk.StringVar(value="0")
-        self.max_val = tk.StringVar(value="60000")
+        self.min_val = tk.StringVar(value="200")
+        self.max_val = tk.StringVar(value="300")
 
         self.title("Lightspeed Prototype Control GUI")
-        self.geometry("1100x1080")
+        self.geometry("1100x900")
 
         self.setup_gui()
 
@@ -1604,8 +1726,8 @@ class CameraGUI(tk.Tk):
         self.camera_status.pack(fill='both', expand=True)
 
         # Status messages
-        self.status_message = tk.Label(self.main_frame, text="", justify=tk.LEFT, anchor="w", 
-                                       width=40, wraplength=400, fg="red")
+        self.status_message = tk.Label(self.main_frame, text="", justify=tk.LEFT, anchor="center", 
+                                       width=40, wraplength=400, fg="red", font=("Arial", 12))
         self.status_message.grid(row=5, column=0, sticky='ew')
         
         # Performance display
@@ -1670,6 +1792,7 @@ class CameraGUI(tk.Tk):
         self.setup_calibration_controls()
         
         # Start update loops
+        self.after(5000, self.monitor_camera_connection)
         self.after(100, self.update_camera_status)
         self.after(50, self.update_frame_display)
         self.after(1000, self.update_performance_monitor)
@@ -1716,23 +1839,29 @@ class CameraGUI(tk.Tk):
 
     def setup_camera_controls(self):
         """Set up camera control widgets - exactly as original"""
-        camera_controls_frame = LabelFrame(self.main_frame, text="Camera Controls", padx=5, pady=5)
+        camera_controls_frame = LabelFrame(self.main_frame, text="Basic Controls", padx=5, pady=5)
         camera_controls_frame.grid(row=0, column=1)
 
-        Label(camera_controls_frame, text="Exposure Time (ms):").grid(row=0, column=0)
+        self.config_manager = SimpleConfigManager()
+        # Add restore button to camera controls frame
+        self.restore_config_button = Button(camera_controls_frame, text="Restore Settings", 
+                                        command=self.restore_previous_config, bg='lightblue')
+        self.restore_config_button.grid(row=0, column=0, columnspan=2, pady=5)
+        
+        # Enable/disable button based on config availability
+        if not self.config_manager.config_exists():
+            self.restore_config_button.config(state='disabled', text='No Previous Settings')
+
+        Label(camera_controls_frame, text="Exposure Time (ms):").grid(row=1, column=0)
         self.exposure_time_var = tk.DoubleVar(value=100)
         self.exposure_time_var.trace_add("write", self.update_exposure_time)
         self.exposure_time_entry = Entry(camera_controls_frame, textvariable=self.exposure_time_var)
-        self.exposure_time_entry.grid(row=0, column=1)
-        
-        # Add countdown timer label
-        self.countdown_label = Label(camera_controls_frame, text="Ready", font=("Courier", 10, "bold"), fg="blue")
-        self.countdown_label.grid(row=1, column=0, columnspan=2)
+        self.exposure_time_entry.grid(row=1, column=1)
 
-        self.start_button = Button(camera_controls_frame, text="Start", command=self.start_capture)
+        self.start_button = Button(camera_controls_frame, text="Start Streaming", command=self.start_capture, fg='green')
         self.start_button.grid(row=2, column=0)
 
-        self.stop_button = Button(camera_controls_frame, text="Stop", command=self.stop_capture)
+        self.stop_button = Button(camera_controls_frame, text="Stop Streaming", command=self.stop_capture, fg='red', state='disabled')
         self.stop_button.grid(row=2, column=1)
 
         self.save_data_var = tk.BooleanVar()
@@ -1750,12 +1879,13 @@ class CameraGUI(tk.Tk):
         self.cube_size_entry = Entry(camera_controls_frame, textvariable=self.cube_size_var)
         self.cube_size_entry.grid(row=5, column=1)
 
-        self.reset_button = Button(camera_controls_frame, text="Reset Camera", command=self.reset_camera)
-        self.reset_button.grid(row=7, column=0, columnspan=1)
+        self.power_cycle_button = Button(camera_controls_frame, text="Reboot Camera",
+                                         fg='red', command=self.power_cycle_camera)
+        self.power_cycle_button.grid(row=7, column=0, columnspan=1)
 
-        self.power_cycle_button = Button(camera_controls_frame, text="Power Cycle Camera",
-                                        command=self.power_cycle_camera)
-        self.power_cycle_button.grid(row=7, column=1, columnspan=1)
+        self.shutdown_button = Button(camera_controls_frame, text="Instrument Shutdown",
+                                    command=self.shutdown_instrument, fg='red')
+        self.shutdown_button.grid(row=7, column=1, columnspan=1)
 
     def setup_calibration_controls(self):
         calibration_controls_frame = LabelFrame(self.main_frame, text="Calibration Controls", padx=5, pady=5)
@@ -1862,63 +1992,79 @@ class CameraGUI(tk.Tk):
         self.frames_per_bundle_entry.grid(row=1, column=1)
         
         Label(advanced_controls_frame, 
-              text="This concatenates frames into one image.").grid(
+              text="This concatenates frames into one image.", font=("Arial", 8), fg="gray").grid(
               row=2, column=0, columnspan=2)
 
     def setup_display_controls(self):
-        """Set up display control widgets - with auto-scaling and frame summing options"""
+        """Set up display control widgets - with linear/log scaling option"""
         display_controls_frame = LabelFrame(self.main_frame, text="Display Controls", padx=5, pady=5)
         display_controls_frame.grid(row=3, column=0)
 
-        # Frame summing controls - add these BEFORE auto-scaling options
+        # Frame summing controls
         sum_frame = Frame(display_controls_frame)
         sum_frame.grid(row=0, column=0, columnspan=4, pady=5)
         
         self.sum_frames_check = Checkbutton(sum_frame, text="Sum Frames:", 
-                                           variable=self.frame_sum_enabled,
-                                           command=self.toggle_frame_summing)
+                                        variable=self.frame_sum_enabled,
+                                        command=self.toggle_frame_summing)
         self.sum_frames_check.pack(side='left', padx=2)
         
         self.sum_count_spinbox = tk.Spinbox(sum_frame, from_=2, to=50, width=5,
-                                           textvariable=self.frame_sum_count,
-                                           command=self.update_sum_count)
+                                        textvariable=self.frame_sum_count,
+                                        command=self.update_sum_count)
         self.sum_count_spinbox.pack(side='left', padx=2)
         
         Label(sum_frame, text="frames").pack(side='left', padx=2)
         
-        # Sum mode selection
         self.sum_mode_var = tk.StringVar(value="Average")
         self.sum_mode_menu = OptionMenu(sum_frame, self.sum_mode_var,
-                                       "Average", "Sum", "Median",
-                                       command=self.update_sum_mode)
+                                    "Average", "Sum", "Median",
+                                    command=self.update_sum_mode)
         self.sum_mode_menu.pack(side='left', padx=5)
         
-        # Status label for summing
         self.sum_status_label = Label(sum_frame, text="", font=("Arial", 9), fg="blue")
         self.sum_status_label.pack(side='left', padx=10)
 
-        # Auto-scaling options (move down a row)
+        # Scaling type selection
+        scaling_frame = Frame(display_controls_frame)
+        scaling_frame.grid(row=1, column=0, columnspan=4, pady=5)
+        
+        Label(scaling_frame, text="Scaling:").pack(side='left', padx=2)
+        
+        self.scaling_type_var = tk.StringVar(value="Linear")
+        self.linear_radio = tk.Radiobutton(scaling_frame, text="Linear", 
+                                        variable=self.scaling_type_var, value="Linear",
+                                        command=self.refresh_frame_display)
+        self.linear_radio.pack(side='left', padx=5)
+        
+        self.log_radio = tk.Radiobutton(scaling_frame, text="Log", 
+                                    variable=self.scaling_type_var, value="Log",
+                                    command=self.refresh_frame_display)
+        self.log_radio.pack(side='left', padx=5)
+
+        # Auto-scaling options
         self.auto_minmax_var = tk.BooleanVar(value=False)
         self.auto_minmax_check = Checkbutton(display_controls_frame, text="Auto Min/Max", 
                                             variable=self.auto_minmax_var, 
                                             command=lambda: self.toggle_auto_scaling('minmax'))
-        self.auto_minmax_check.grid(row=1, column=0, columnspan=2)
+        self.auto_minmax_check.grid(row=2, column=0, columnspan=2)
         
         self.auto_zscale_var = tk.BooleanVar(value=False)
         self.auto_zscale_check = Checkbutton(display_controls_frame, text="Auto Zscale", 
                                             variable=self.auto_zscale_var,
                                             command=lambda: self.toggle_auto_scaling('zscale'))
-        self.auto_zscale_check.grid(row=1, column=2, columnspan=2)
+        self.auto_zscale_check.grid(row=2, column=2, columnspan=2)
 
-        # Manual scaling controls (move down a row)
-        Label(display_controls_frame, text="Min Count:").grid(row=2, column=0)
+        # Manual scaling controls
+        Label(display_controls_frame, text="Min Count:").grid(row=3, column=0)
+        self.min_val.trace_add("write", self.refresh_frame_display)
         self.min_entry = Entry(display_controls_frame, textvariable=self.min_val, width=8)
-        self.min_entry.grid(row=2, column=1)
+        self.min_entry.grid(row=3, column=1)
 
-        Label(display_controls_frame, text="Max Count:").grid(row=2, column=2)
+        Label(display_controls_frame, text="Max Count:").grid(row=3, column=2)
         self.max_val.trace_add("write", self.refresh_frame_display)
         self.max_entry = Entry(display_controls_frame, textvariable=self.max_val, width=8)
-        self.max_entry.grid(row=2, column=3)
+        self.max_entry.grid(row=3, column=3)
 
     def setup_peripherals_controls(self):
         """Set up peripheral control widgets - exactly as original"""
@@ -1947,7 +2093,7 @@ class CameraGUI(tk.Tk):
         self.setup_motor_controls()
         
         # PDU outlet controls
-        self.setup_pdu_controls()
+        # self.setup_pdu_controls()
 
     def setup_motor_controls(self):
         """Set up motor control widgets - exactly as original"""
@@ -1985,17 +2131,17 @@ class CameraGUI(tk.Tk):
         Button(zoom_preset_frame, text="3x", width=6,
                command=lambda: self.move_zoom_preset(0)).pack(side='left', padx=2)
         
-        self.zoom_ref_button = Button(zoom_preset_frame, text="Set 3x pos", width=10, bg='orange',
-                                      command=self.set_zoom_reference).pack(side='left', padx=2)
+        self.zoom_ref_button = Button(zoom_preset_frame, text="Set 3x Pos", width=10, bg='orange',
+                                      command=self.set_zoom_reference)
+        self.zoom_ref_button.pack(side='left', padx=2)
 
         # Emergency relative movement (with warning)
-        Label(self.peripherals_controls_frame, text="Relative Zoom Shift (deg):", 
-              fg="red", font=("Arial", 9, "bold")).grid(row=5, column=0, sticky='w')
+        Label(self.peripherals_controls_frame, text="Relative Zoom Shift (deg):").grid(row=5, column=0, sticky='w')
         self.zoom_emergency_var = tk.StringVar(value='0')
         self.zoom_emergency_entry = Entry(self.peripherals_controls_frame, 
-                                         textvariable=self.zoom_emergency_var, width=8)
+                                         textvariable=self.zoom_emergency_var, width=5)
         self.zoom_emergency_entry.grid(row=5, column=1)
-        Button(self.peripherals_controls_frame, text="Apply", fg='red',
+        Button(self.peripherals_controls_frame, text="Apply",
                command=self.emergency_zoom_move).grid(row=5, column=2)
         
         Label(self.peripherals_controls_frame, text="(+: zoom in, -: zoom out)", 
@@ -2006,7 +2152,7 @@ class CameraGUI(tk.Tk):
         Label(self.peripherals_controls_frame, text="Relative Focus Shift (deg):").grid(row=6, column=0)
         self.focus_position_var = tk.StringVar(value='0')
         self.focus_position_entry = Entry(self.peripherals_controls_frame, 
-                                          textvariable=self.focus_position_var, width=8)
+                                          textvariable=self.focus_position_var, width=5)
         self.focus_position_entry.grid(row=6, column=1)
         self.set_focus_button = Button(self.peripherals_controls_frame, text="Apply",
                                        command=self.update_focus_position)
@@ -2018,10 +2164,9 @@ class CameraGUI(tk.Tk):
         # Focus initialization button
         self.focus_init_button = Button(self.peripherals_controls_frame, text="Reset Focus",
                                        command=self.manual_focus_init)
-        self.focus_init_button.grid(row=7, column=0, columnspan=2) #TBT
+        self.focus_init_button.grid(row=7, column=0, columnspan=1) #TBT
         Label(self.peripherals_controls_frame, text="(Initialize to near optimal focus)", 
-              font=("Arial", 8), fg="gray").grid(row=7, column=2, columnspan=2, sticky='w') #TBT
-
+              font=("Arial", 8), fg="gray").grid(row=7, column=1, columnspan=2, sticky='w') #TBT
 
     def setup_pdu_controls(self):
         """Set up PDU outlet control widgets - exactly as original"""
@@ -2049,6 +2194,24 @@ class CameraGUI(tk.Tk):
                                  command=lambda i=idx: self.toggle_outlet(i))
             btn.grid(row=row, column=col + 1, padx=2, pady=2)
             self.pdu_outlet_buttons[idx] = btn
+
+    def restore_previous_config(self):
+        """Restore previous configuration"""
+        if self.camera_thread.capturing:
+            self.update_status("Cannot restore during capture", "orange")
+            return
+        
+        success = self.config_manager.load_config(self)
+        if success:
+            self.update_status("Previous settings restored", "green")
+            logging.info("Configuration restored from file")
+        else:
+            self.update_status("Failed to restore settings", "red")
+
+    def save_config_on_changes(self):
+        """Auto-save configuration when settings change"""
+        if hasattr(self, 'config_manager'):
+            self.config_manager.save_config(self)
 
     def set_filter_position_display(self, position_string):
         """Set filter position display without triggering callback"""
@@ -2078,6 +2241,13 @@ class CameraGUI(tk.Tk):
         """Update GPS timestamp display"""
         self.after(0, lambda: self.gps_timestamp_label.config(text=timestamp_str))
 
+    def monitor_camera_connection(self):
+        # If camera is not connected, reboot it
+        if self.camera_thread is not None and not self.camera_thread.is_connected:
+            self.power_cycle_camera()
+
+        self.after(2000, self.update_camera_status)
+
     def update_camera_status(self):
         """Update camera status display"""
         if self.updating_camera_status:
@@ -2100,6 +2270,10 @@ class CameraGUI(tk.Tk):
         """Update frame display - optimized for smooth display with summing support"""
         if self.updating_frame_display:
             try:
+                # In case of long time between frames, redisplay last frame
+                # Remove this if observing excess crashhes
+                if self.frame_queue.empty() and self.last_frame is not None:
+                    self.process_frame(self.last_frame)
                 # Process only one frame per update for smoother display
                 if not self.frame_queue.empty():
                     try:
@@ -2112,11 +2286,6 @@ class CameraGUI(tk.Tk):
                             self.add_frame_to_buffer(frame)
                         else:
                             self.process_frame(frame)
-                        
-                        # When we get a frame, update counters for countdown
-                        if self.countdown_active:
-                            self.frame_count += 1
-                            self.last_frame_time = time.time()  # Reset timer for next frame
                             
                     except queue.Empty:
                         pass
@@ -2227,6 +2396,43 @@ class CameraGUI(tk.Tk):
         zmax = min(zmax, data_max)
         
         return int(zmin), int(zmax)
+    
+    def apply_scaling(self, data, min_val, max_val, scaling_type="Linear"):
+        """Apply linear or logarithmic scaling to image data"""
+        try:
+            # Ensure data is float for calculations
+            data_float = data.astype(np.float64)
+            
+            if scaling_type == "Log":
+                # Add small offset to avoid log(0)
+                offset = 1.0
+                data_clip = np.clip(data_float, min_val, max_val) - min_val + offset
+                log_min = 0
+                log_max = np.log10(max_val - min_val + offset)
+                log_data = np.log10(data_clip)
+                
+                # Scale to 0-255 range
+                if log_max > log_min:
+                    scaled = ((log_data - log_min) / (log_max - log_min)) * 255
+                else:
+                    scaled = np.zeros_like(log_data)
+                    
+            else:  # Linear scaling
+                # Standard linear scaling
+                if max_val > min_val:
+                    scaled = ((data_float - min_val) / (max_val - min_val)) * 255
+                else:
+                    scaled = np.zeros_like(data_float)
+            
+            # Clip to valid range and convert to uint8
+            scaled = np.clip(scaled, 0, 255).astype(np.uint8)
+            
+            return scaled
+            
+        except Exception as e:
+            logging.error(f"Error in scaling: {e}")
+            # Fallback to simple linear scaling
+            return np.clip(((data.astype(np.float32) - min_val) / max(max_val - min_val, 1)) * 255, 0, 255).astype(np.uint8)
 
     def process_frame(self, data):
         """Process and display a frame with auto-scaling support and summing info"""
@@ -2236,52 +2442,32 @@ class CameraGUI(tk.Tk):
         try:
             # Apply auto-scaling if enabled
             if self.auto_minmax_var.get():
-                # Simple min/max scaling
                 min_val = int(np.min(data))
                 max_val = int(np.max(data))
             elif self.auto_zscale_var.get():
-                # Zscale algorithm
                 min_val, max_val = self.compute_zscale(data)
             else:
-                # Use manual values
                 try:
                     min_val = int(self.min_val.get())
                     max_val = int(self.max_val.get())
                 except:
-                    min_val, max_val = 0, 200
+                    min_val, max_val = 0, 65535
 
             if max_val <= min_val:
                 min_val = 0
                 max_val = 65535 if data.dtype == np.uint16 else 255
-                
-            scaled_data = np.clip((data.astype(np.float32) - min_val) / (max_val - min_val) * 255, 0, 255).astype(np.uint8)
+            
+            # Apply scaling (linear or log)
+            scaling_type = self.scaling_type_var.get()
+            scaled_data = self.apply_scaling(data, min_val, max_val, scaling_type)
 
             # Flip horizontally
             # Commenting now because qCMOS is on folded arm
             # scaled_data = cv2.flip(scaled_data, 1)
-            
-            # Convert to BGR
-            if len(scaled_data.shape) == 2:
-                scaled_data_bgr = cv2.cvtColor(scaled_data, cv2.COLOR_GRAY2BGR)
-            else:
-                scaled_data_bgr = scaled_data
-
-            # Add text overlay if summing is active
-            if self.frame_sum_enabled.get() and self.frames_in_sum > 0:
-                mode = self.sum_mode_var.get()
-                text = f"{mode}: {self.frames_in_sum} frames"
-                cv2.putText(scaled_data_bgr, text, (10, 30), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-                
-                # Show statistics
-                if isinstance(data, np.ndarray):
-                    stats_text = f"Mean: {np.mean(data):.1f} | Std: {np.std(data):.1f}"
-                    cv2.putText(scaled_data_bgr, stats_text, (10, 60),
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 1)
 
             # Draw any overlays
-            if hasattr(self, 'circle_center'):
-                cv2.circle(scaled_data_bgr, self.circle_center, 2, (255, 0, 0), 2)
+            # if hasattr(self, 'circle_center'):
+            #     cv2.circle(scaled_data, self.circle_center, 2, (255, 0, 0), 2)
 
             # Create window if needed
             if not hasattr(self, 'opencv_window_created'):
@@ -2289,7 +2475,7 @@ class CameraGUI(tk.Tk):
                 cv2.setMouseCallback('Captured Frame', self.on_right_click)
                 self.opencv_window_created = True
 
-            cv2.imshow('Captured Frame', scaled_data_bgr)
+            cv2.imshow('Captured Frame', scaled_data)
             cv2.waitKey(1)
             
         finally:
@@ -2301,14 +2487,14 @@ class CameraGUI(tk.Tk):
             self.after(0, lambda: self.show_context_menu(x, y))
 
     def show_context_menu(self, x, y):
-        """Show context menu for frame display"""
+        """Show context menu on right-click"""
         menu = tk.Menu(self, tearoff=0)
         menu.add_command(label="Draw Circle", command=lambda: self.draw_circle(x, y))
         menu.add_command(label="Clear Markers", command=self.clear_markers)
         try:
             menu.tk_popup(self.winfo_pointerx(), self.winfo_pointery())
-        except:
-            pass
+        finally:
+            menu.grab_release()
 
     def draw_circle(self, x, y):
         """Draw circle on frame"""
@@ -2484,18 +2670,7 @@ class CameraGUI(tk.Tk):
             self.update_status("Starting capture...", "blue")
             self.update_gps_timestamp("Waiting for GPS...")
 
-            # Start countdown timer if exposure > 1 second
             self.frame_count = 0
-            self.last_frame_time = time.time()  # Start timing from capture start
-            
-            # Start countdown if exposure > 1 second
-            if self.exposure_time_var.get() > 1000:
-                self.countdown_active = True
-                self.countdown_label.config(text=f"Frame 1 - {self.exposure_time_var.get() / 1000:.0f}s remaining")
-                self.run_countdown()
-            else:
-                self.countdown_label.config(text="")
-
             # Set up save thread if needed - using optimized save thread
             if self.save_data_var.get():
                 save_queue = queue.Queue(maxsize=50000)
@@ -2527,8 +2702,6 @@ class CameraGUI(tk.Tk):
         """Stop camera capture"""
         try:
             self.update_status("Stopping capture...", "blue")
-            self.countdown_active = False
-            self.countdown_label.config(text="")
             self.camera_thread.stop_capture()
 
             # Stop save thread
@@ -2561,15 +2734,18 @@ class CameraGUI(tk.Tk):
         """Disable controls during capture"""
         controls = [
             self.exposure_time_entry, self.save_data_checkbox, 
-            self.start_button, self.reset_button, self.binning_menu,
+            self.start_button, self.binning_menu,
             self.bit_depth_menu, self.readout_speed_menu, self.sensor_mode_menu,
             self.subarray_mode_menu, self.framebundle_checkbox, 
             self.frames_per_bundle_entry, self.power_cycle_button,
-            self.take_darks_button, self.take_flats_button
+            self.take_darks_button, self.take_flats_button, self.take_biases_button,
+            self.restore_config_button
         ]
         
         for widget in controls:
             widget.config(state='disabled')
+
+        self.stop_button.config(state='normal')
         
         if self.subarray_mode_var.get() == "On":
             for entry in self.subarray_entries.values():
@@ -2579,15 +2755,18 @@ class CameraGUI(tk.Tk):
         """Enable controls after capture"""
         controls = [
             self.exposure_time_entry, self.save_data_checkbox,
-            self.start_button, self.reset_button, self.binning_menu,
+            self.start_button, self.binning_menu,
             self.bit_depth_menu, self.readout_speed_menu, self.sensor_mode_menu,
             self.subarray_mode_menu, self.framebundle_checkbox,
             self.frames_per_bundle_entry, self.power_cycle_button,
-            self.take_darks_button, self.take_flats_button
+            self.take_darks_button, self.take_flats_button, self.take_biases_button,
+            self.restore_config_button
         ]
         
         for widget in controls:
             widget.config(state='normal')
+
+        self.stop_button.config(state='disabled')
 
         if self.subarray_mode_var.get() == "On":
             for entry in self.subarray_entries.values():
@@ -2595,13 +2774,28 @@ class CameraGUI(tk.Tk):
 
     def power_cycle_camera(self):
         """Power cycle the camera"""
+
         try:
             self.peripherals_thread.command_outlet(12, OutletCommand.IMMEDIATE_OFF)
+            self.after(1000, lambda: self.update_status("Powering off camera...", "blue"))
             self.after(1000, lambda: self.peripherals_thread.command_outlet(12, OutletCommand.IMMEDIATE_ON))
-            logging.info("Camera power cycled")
+            self.after(2000, lambda: self.update_status("Powering on camera...", "blue"))
+            self.after(2000, lambda: logging.info("Camera power cycled"))
             self.after(3000, self.reset_camera)
+            self.update_camera_status()
         except Exception as e:
             logging.error(f"Power cycle error: {e}")
+
+    def shutdown_instrument(self):
+        """Shutdown the instrument"""
+        # Check that user is certain
+        if not messagebox.askyesno("Confirm Shutdown",
+                                   "Are you sure you want to shutdown the instrument?\n"
+                                   "This will power off the camera and close the application."):
+            return
+        logging.info("Shutting down instrument...")
+        self.peripherals_thread.command_outlet(12, OutletCommand.IMMEDIATE_OFF)
+        self.on_close()
 
     def take_biases(self):
         def _take_biases():
@@ -2613,6 +2807,7 @@ class CameraGUI(tk.Tk):
             self.save_data_var.set(True)
             self.object_name_entry.delete(0, tk.END)
             self.object_name_entry.insert(0, "bias")
+            self.exposure_time_var.set(0)
             self.camera_thread.set_property('EXPOSURE_TIME', 0)
             # Clear queues before starting
             while not self.frame_queue.empty():
@@ -2644,6 +2839,7 @@ class CameraGUI(tk.Tk):
             self.save_data_var.set(True)
             self.object_name_entry.delete(0, tk.END)
             self.object_name_entry.insert(0, "dark_10000_ms")
+            self.exposure_time_var.set(10000)
             self.camera_thread.set_property('EXPOSURE_TIME', 10)
             
             # Clear queues before starting
@@ -2870,7 +3066,6 @@ class CameraGUI(tk.Tk):
         
         threading.Thread(target=_take_flats, daemon=True).start()
 
-    # Peripheral control methods - all unchanged
     def update_peripherals_status(self):
         """Update peripheral status periodically"""
         if self.updating_peripherals_status and self.peripherals_thread and not self._peripheral_update_running:
@@ -2995,6 +3190,7 @@ class CameraGUI(tk.Tk):
             def _set_ref():
                 if self.peripherals_thread.set_zoom_reference():
                     self.update_status(f"Zoom reference set at 3x zoom-out", "green")
+                    self.zoom_ref_button.config(bg='lightgreen', text='Zoom Ref Set', state='disabled')
                 else:
                     self.update_status("Failed to set zoom reference", "red")
             
@@ -3010,7 +3206,7 @@ class CameraGUI(tk.Tk):
                 
             response = messagebox.askyesno("MOVEMENT WARNING", 
                 f"You are about to move {relative_degrees:+.1f}° relatively.\n\n"
-                f"This may hit mechanical limits!\n\n"
+                f"This may hit mechanical limits and will unset the zoom reference if set!\n\n"
                 f"Are you absolutely sure?")
             
             if not response:
@@ -3030,6 +3226,7 @@ class CameraGUI(tk.Tk):
                 if self.peripherals_thread.move_zoom_relative(relative_degrees):
                     self.update_status(f"Emergency move {relative_degrees:+.1f}° complete", "orange")
                     self.after(100, lambda: self.zoom_emergency_var.set('0'))
+                    self.zoom_ref_button.config(bg='orange', text='Set 3x Pos', state='normal')
                 else:
                     self.update_status("Emergency move failed", "red")
             
@@ -3097,31 +3294,6 @@ class CameraGUI(tk.Tk):
         except Exception as e:
             debug_logger.error(f"Toggle outlet error: {e}")
 
-    def run_countdown(self):
-        """Simple countdown that runs continuously during capture"""
-        if not self.countdown_active or not self.camera_thread.capturing:
-            self.countdown_label.config(text="")
-            return
-        
-        # Calculate elapsed time since last frame (or start)
-        elapsed = time.time() - self.last_frame_time
-        remaining = max(0, self.exposure_time_var.get() / 1000 - elapsed)
-
-        if remaining > 0:
-            # Still exposing
-            if remaining >= 10:
-                text = f"Frame {self.frame_count + 1} - {remaining:.0f}s remaining"
-            else:
-                text = f"Frame {self.frame_count + 1} - {remaining:.1f}s remaining"
-            self.countdown_label.config(text=text)
-        else:
-            # Exposure complete, waiting for readout
-            text = f"Frame {self.frame_count + 1} - Reading..."
-            self.countdown_label.config(text=text)
-        
-        # Schedule next update
-        self.after(100, self.run_countdown)
-
     def update_tcs_status(self):
         """Update TCS status display"""
         if hasattr(self, 'tcs_thread') and self.tcs_thread:
@@ -3130,7 +3302,7 @@ class CameraGUI(tk.Tk):
             
             if data_age < 10:  # Data is recent, so TCS is responding
                 tcs_data = self.tcs_thread.get_current_data()
-                status_text = f"TCS: Connected | RA: {tcs_data['ra']} | Dec: {tcs_data['dec']} | Airmass: {tcs_data['airmass']}"
+                status_text = f"TCS: Connected | RA: {tcs_data['ra']} | Dec: {tcs_data['dec']}\n Rotator: {tcs_data['rotator_encoder_angle']} | Airmass: {tcs_data['airmass']}"
                 self.tcs_status_label.config(text=status_text, fg="green")
             else:
                 # Data is stale, TCS might not be responding
@@ -3244,6 +3416,9 @@ class CameraGUI(tk.Tk):
         """Handle application close"""
         try:
             logging.info("Closing application")
+            if hasattr(self, 'config_manager'):
+                self.config_manager.save_config(self)
+                logging.info("Configuration saved on exit")
             
             # Stop all updates
             self.updating_camera_status = False
@@ -3302,7 +3477,7 @@ def main():
         except RuntimeError:
             pass
             
-        logging.info("Starting Camera Control Application (Optimized)")
+        logging.info("Starting Camera Control Application")
         logging.info(f"CPU cores available: {mp.cpu_count()}")
         
         # Create shared resources
