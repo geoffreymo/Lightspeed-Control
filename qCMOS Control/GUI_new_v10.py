@@ -1693,10 +1693,8 @@ class CameraGUI(tk.Tk):
         self.frame_buffer = deque(maxlen=50)  # Circular buffer for frames
         self.summed_frame = None
         self.frames_in_sum = 0
-        self.roi_selecting = False
-        self.roi_start_point = None
-        self.roi_end_point = None
-        self.roi_drawing = False
+        self.mouse_x = None
+        self.mouse_y = None
         
         # Performance monitoring
         self.last_fps_update = time.time()
@@ -2065,6 +2063,9 @@ class CameraGUI(tk.Tk):
         self.max_val.trace_add("write", self.refresh_frame_display)
         self.max_entry = Entry(display_controls_frame, textvariable=self.max_val, width=8)
         self.max_entry.grid(row=3, column=3)
+
+        self.pixel_info_label = Label(display_controls_frame, text="Pixel (x,y): -- Value: --", font=("Courier", 10))
+        self.pixel_info_label.grid(row=4, column=0, columnspan=4)
 
     def setup_peripherals_controls(self):
         """Set up peripheral control widgets - exactly as original"""
@@ -2472,42 +2473,135 @@ class CameraGUI(tk.Tk):
             # Create window if needed
             if not hasattr(self, 'opencv_window_created'):
                 cv2.namedWindow('Captured Frame', cv2.WINDOW_NORMAL)
-                cv2.setMouseCallback('Captured Frame', self.on_right_click)
+                cv2.setMouseCallback('Captured Frame', self.on_mouse_move)
+                # cv2.setMouseCallback('Captured Frame', self.on_right_click)
                 self.opencv_window_created = True
 
             cv2.imshow('Captured Frame', scaled_data)
             cv2.waitKey(1)
+            self.update_pixel_info(self.mouse_x, self.mouse_y)
             
         finally:
             self.display_lock.release()
-
-    def on_right_click(self, event, x, y, flags, param):
-        """Handle right click on frame display"""
-        if event == cv2.EVENT_RBUTTONDOWN:
-            self.after(0, lambda: self.show_context_menu(x, y))
-
-    def show_context_menu(self, x, y):
-        """Show context menu on right-click"""
-        menu = tk.Menu(self, tearoff=0)
-        menu.add_command(label="Draw Circle", command=lambda: self.draw_circle(x, y))
-        menu.add_command(label="Clear Markers", command=self.clear_markers)
+    
+    def on_mouse_move(self, event, x, y, flags, param):
+        """Handle mouse movement over frame display"""
+        if event == cv2.EVENT_MOUSEMOVE:
+            self.mouse_x = x
+            self.mouse_y = y
+            self.update_pixel_info(x, y)
+    
+    def update_pixel_info(self, x, y):
+        """Update the pixel info label with current mouse position and pixel value"""
         try:
-            menu.tk_popup(self.winfo_pointerx(), self.winfo_pointery())
-        finally:
-            menu.grab_release()
+            # Use the appropriate frame data source
+            if self.frame_sum_enabled.get() and self.summed_frame is not None:
+                frame_data = self.summed_frame
+            elif self.last_frame is not None:
+                frame_data = self.last_frame
+            else:
+                frame_data = None
+            
+            if frame_data is not None:
+                # Get frame dimensions
+                height, width = frame_data.shape[:2]
+                
+                # Check if coordinates are within bounds
+                if 0 <= x < width and 0 <= y < height:
+                    # Get pixel value at the location
+                    pixel_value = frame_data[y, x]
+                    
+                    # Format the display string
+                    if isinstance(pixel_value, (np.integer, int)):
+                        info_text = f"Pixel: ({x:4d}, {y:4d}) | Value: {pixel_value:5d}"
+                    else:
+                        # For float values (e.g., from summed/averaged frames)
+                        info_text = f"Pixel: ({x:4d}, {y:4d}) | Value: {pixel_value:8.1f}"
+                else:
+                    info_text = "Pixel: (---, ---) | Value: -----"
+            else:
+                info_text = "Pixel: (---, ---) | Value: -----"
+                
+            # Update the label in the GUI thread
+            self.after(0, lambda: self.pixel_info_label.config(text=info_text))
+            
+        except Exception as e:
+            debug_logger.error(f"Error updating pixel info: {e}")
 
-    def draw_circle(self, x, y):
-        """Draw circle on frame"""
-        self.circle_center = (x, y)
-        if self.last_frame is not None:
-            self.process_frame(self.last_frame)
+    # def process_frame(self, data):
+    #     """Process and display a frame with auto-scaling support and summing info"""
+    #     if not self.display_lock.acquire(blocking=False):
+    #         return
+            
+    #     try:
+    #         # Apply auto-scaling if enabled
+    #         if self.auto_minmax_var.get():
+    #             min_val = int(np.min(data))
+    #             max_val = int(np.max(data))
+    #         elif self.auto_zscale_var.get():
+    #             min_val, max_val = self.compute_zscale(data)
+    #         else:
+    #             try:
+    #                 min_val = int(self.min_val.get())
+    #                 max_val = int(self.max_val.get())
+    #             except:
+    #                 min_val, max_val = 0, 65535
 
-    def clear_markers(self):
-        """Clear all markers from frame"""
-        if hasattr(self, 'circle_center'):
-            del self.circle_center
-        if self.last_frame is not None:
-            self.process_frame(self.last_frame)
+    #         if max_val <= min_val:
+    #             min_val = 0
+    #             max_val = 65535 if data.dtype == np.uint16 else 255
+            
+    #         # Apply scaling (linear or log)
+    #         scaling_type = self.scaling_type_var.get()
+    #         scaled_data = self.apply_scaling(data, min_val, max_val, scaling_type)
+
+    #         # Flip horizontally
+    #         # Commenting now because qCMOS is on folded arm
+    #         # scaled_data = cv2.flip(scaled_data, 1)
+
+    #         # Draw any overlays
+    #         # if hasattr(self, 'circle_center'):
+    #         #     cv2.circle(scaled_data, self.circle_center, 2, (255, 0, 0), 2)
+
+    #         # Create window if needed
+    #         if not hasattr(self, 'opencv_window_created'):
+    #             cv2.namedWindow('Captured Frame', cv2.WINDOW_GUI_NORMAL)
+    #             # cv2.setMouseCallback('Captured Frame', self.on_right_click)
+    #             self.opencv_window_created = True
+
+    #         cv2.imshow('Captured Frame', scaled_data)
+    #         cv2.waitKey(1)
+            
+    #     finally:
+    #         self.display_lock.release()
+
+    # def on_right_click(self, event, x, y, flags, param):
+    #     """Handle right click on frame display"""
+    #     if event == cv2.EVENT_RBUTTONDOWN:
+    #         self.after(0, lambda: self.show_context_menu(x, y))
+
+    # def show_context_menu(self, x, y):
+    #     """Show context menu on right-click"""
+    #     menu = tk.Menu(self, tearoff=0)
+    #     menu.add_command(label="Draw Circle", command=lambda: self.draw_circle(x, y))
+    #     menu.add_command(label="Clear Markers", command=self.clear_markers)
+    #     try:
+    #         menu.tk_popup(self.winfo_pointerx(), self.winfo_pointery())
+    #     finally:
+    #         menu.grab_release()
+
+    # def draw_circle(self, x, y):
+    #     """Draw circle on frame"""
+    #     self.circle_center = (x, y)
+    #     if self.last_frame is not None:
+    #         self.process_frame(self.last_frame)
+
+    # def clear_markers(self):
+    #     """Clear all markers from frame"""
+    #     if hasattr(self, 'circle_center'):
+    #         del self.circle_center
+    #     if self.last_frame is not None:
+    #         self.process_frame(self.last_frame)
 
     def update_exposure_time(self, *_):
         """Update exposure time"""
@@ -3124,9 +3218,13 @@ class CameraGUI(tk.Tk):
                 option = self.slit_position_var.get()
                 with self.peripherals_thread.peripherals_lock:
                     if option == 'In beam':
+                        self.update_status(f"Moving slit into beam", "blue")
                         self.peripherals_thread.ax_a_1.move_absolute(0, Units.LENGTH_MILLIMETRES)
+                        self.update_status("Slit moved into beam", "green")
                     else:
+                        self.update_status(f"Moving slit out of beam", "blue")
                         self.peripherals_thread.ax_a_1.move_absolute(70, Units.LENGTH_MILLIMETRES)
+                        self.update_status("Slit moved out of beam", "green")
             except Exception as e:
                 debug_logger.error(f"Slit error: {e}")
         
@@ -3140,9 +3238,14 @@ class CameraGUI(tk.Tk):
                     return
                 option = self.halpha_qwp_var.get()
                 positions = {'Halpha': 151.5, 'QWP': 23.15, 'Neither': 87.18}
+                if option == 'Neither':
+                    self.update_status("Moving Halpha/QWP out of beam", "blue")
+                else:
+                    self.update_status(f"Moving {option} into beam", "blue")
                 with self.peripherals_thread.peripherals_lock:
                     self.peripherals_thread.ax_b_3.move_absolute(
                         positions[option], Units.LENGTH_MILLIMETRES)
+                    self.update_status(f"Halpha/QWP stage moved to {option}", "green")
             except Exception as e:
                 debug_logger.error(f"Halpha/QWP error: {e}")
         
@@ -3156,9 +3259,14 @@ class CameraGUI(tk.Tk):
                     return
                 option = self.wire_grid_var.get()
                 positions = {'WeDoWo': 17.78, 'Wire Grid': 128.5, 'Neither': 60.66}
+                if option == 'Neither':
+                    self.update_status("Moving WeDoWo/Wire Grid out of beam", "blue")
+                else:
+                    self.update_status(f"Moving {option} into beam", "blue")
                 with self.peripherals_thread.peripherals_lock:
                     self.peripherals_thread.ax_b_2.move_absolute(
                         positions[option], Units.LENGTH_MILLIMETRES)
+                    self.update_status(f"Polarization stage moved to {option}", "green")
             except Exception as e:
                 debug_logger.error(f"Pol stage error: {e}")
         
