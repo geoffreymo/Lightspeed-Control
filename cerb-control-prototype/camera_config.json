@@ -1,0 +1,18 @@
+{
+  "exposure_time_ms": 6000.0,
+  "binning": "1x1",
+  "bit_depth": "16-bit",
+  "readout_speed": "Ultra Quiet Mode",
+  "sensor_mode": "Standard",
+  "subarray_mode": "Off",
+  "save_data": true,
+  "object_name": "",
+  "frames_per_datacube": 100,
+  "min_count": "200",
+  "max_count": "80000",
+  "scaling_type": "Linear",
+  "subarray_hpos": 0,
+  "subarray_hsize": 4096,
+  "subarray_vpos": 0,
+  "subarray_vsize": 2304
+}
