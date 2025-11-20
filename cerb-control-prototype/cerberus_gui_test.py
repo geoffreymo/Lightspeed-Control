@@ -8,7 +8,7 @@ import numpy as np
 import cv2
 import queue
 from astropy.io import fits
-from datetime import datetime
+from datetime import datetime, timezone
 import os
 import json
 import warnings
@@ -230,12 +230,42 @@ class CameraThread(threading.Thread):
         
         # Queue for saving if enabled
         if self.save_queue is not None:
+            queue_size = self.save_queue.qsize()
+            max_size = self.save_queue.maxsize
+            
+            # Apply backpressure if queue is getting dangerously full
+            # Drop frames before we run out of memory
+            if queue_size > max_size * 0.9:
+                if not hasattr(self, '_backpressure_warned'):
+                    self._backpressure_warned = True
+                    logging.error(f"BACKPRESSURE: Save queue {queue_size}/{max_size} ({100*queue_size/max_size:.1f}% full) - "
+                                 f"disk writes cannot keep up with capture rate! Dropping frames to prevent OOM.")
+                # Drop this frame to prevent memory explosion
+                if not hasattr(self, '_frames_dropped_backpressure'):
+                    self._frames_dropped_backpressure = 0
+                self._frames_dropped_backpressure += 1
+                return  # Skip saving this frame
+            elif queue_size > max_size * 0.8:
+                # Warning level - still saving but close to limit
+                if not hasattr(self, '_last_backpressure_warning'):
+                    self._last_backpressure_warning = 0
+                if time.time() - self._last_backpressure_warning > 5.0:
+                    logging.warning(f"Save queue filling up: {queue_size}/{max_size} ({100*queue_size/max_size:.1f}% full) - "
+                                   f"approaching backpressure threshold")
+                    self._last_backpressure_warning = time.time()
+            else:
+                # Reset warning flags when queue drains
+                if hasattr(self, '_backpressure_warned'):
+                    delattr(self, '_backpressure_warned')
+            
             try:
-                if self.save_queue.qsize() > 10000:
-                    logging.warning(f"Save queue getting full: {self.save_queue.qsize()}")
                 self.save_queue.put_nowait((frame, corrected_timestamp, corrected_framestamp))
             except queue.Full:
-                logging.warning("Save queue full - dropping frame")
+                # This shouldn't happen with backpressure, but handle it anyway
+                if not hasattr(self, '_frames_dropped_full'):
+                    self._frames_dropped_full = 0
+                self._frames_dropped_full += 1
+                logging.error(f"Save queue full despite backpressure - dropped frame (total: {self._frames_dropped_full})")
 
         self.frame_index += 1
 
@@ -397,6 +427,17 @@ class CameraThread(threading.Thread):
         self.running = False
         self.stop_requested.set()
         
+        # Report backpressure statistics if any frames were dropped
+        if hasattr(self, '_frames_dropped_backpressure') and self._frames_dropped_backpressure > 0:
+            total_frames = self.frame_index
+            drop_rate = 100.0 * self._frames_dropped_backpressure / total_frames if total_frames > 0 else 0
+            logging.warning(f"Camera thread backpressure statistics: {self._frames_dropped_backpressure} frames dropped "
+                          f"out of {total_frames} captured ({drop_rate:.2f}% drop rate)")
+            logging.warning("Backpressure drops indicate disk writes could not keep up with capture rate")
+        
+        if hasattr(self, '_frames_dropped_full') and self._frames_dropped_full > 0:
+            logging.error(f"Queue full drops (should not happen): {self._frames_dropped_full} frames")
+        
         if self.capturing:
             self.stop_capture()
         
@@ -420,7 +461,7 @@ class CameraThread(threading.Thread):
 class SaveThread(threading.Thread):
     """Optimized save thread for high-speed FITS writing"""
     
-    def __init__(self, save_queue, camera_thread, object_name, shared_data, batch_size):
+    def __init__(self, save_queue, camera_thread, object_name, shared_data, batch_size, base_path=None):
         super().__init__(name="SaveThread")
         self.save_queue = save_queue
         self.running = True
@@ -429,6 +470,7 @@ class SaveThread(threading.Thread):
         self.batch_size = batch_size
         self.cube_index = 0
         self.shared_data = shared_data
+        self.base_path = base_path or os.getcwd()  # Use provided path or current directory
         self.save_folder = "captures"
         
         # Preallocated buffers to avoid list append overhead
@@ -450,7 +492,7 @@ class SaveThread(threading.Thread):
         self.pending_writes = []
         
         # Memory monitoring
-        self.max_pending_writes = 4  # Limit in-flight writes to control memory
+        self.max_pending_writes = 6  # Increased to keep more workers busy and handle variable write speeds
         
     def preallocate_buffers(self, frame_shape, frame_dtype):
         """Preallocate buffers based on frame size"""
@@ -467,8 +509,11 @@ class SaveThread(threading.Thread):
             
             start_time_filename_str = time.strftime('%Y%m%d_%H%M%S')
             date_str = time.strftime('%Y_%m_%d')
-            self.save_folder = f"captures_{date_str}"
+            
+            # Create save folder in the specified base path
+            self.save_folder = os.path.join(self.base_path, f"captures_{date_str}")
             os.makedirs(self.save_folder, exist_ok=True)
+            logging.info(f"Saving data to: {self.save_folder}")
             
             # Track consecutive drops for warning escalation
             consecutive_drops = 0
@@ -619,7 +664,7 @@ class SaveThread(threading.Thread):
             # Create FITS HDUs
             primary_hdu = fits.PrimaryHDU()
             primary_hdu.header['OBJECT'] = (object_name, 'Object name')
-            primary_hdu.header['DATE-OBS'] = (datetime.utcnow().isoformat(), 'UTC date of observation')
+            primary_hdu.header['DATE-OBS'] = (datetime.now(timezone.utc).isoformat(), 'UTC date of observation')
             primary_hdu.header['CUBEIDX'] = (cube_index, 'Cube index number')
             primary_hdu.header['NFRAMES'] = (n_frames, 'Number of frames in cube')
 
@@ -768,6 +813,7 @@ class SimpleConfigManager:
                 "subarray_mode": gui_instance.subarray_mode_var.get(),
                 "save_data": gui_instance.save_data_var.get(),
                 "object_name": gui_instance.object_name_entry.get(),
+                "output_path": gui_instance.output_path_var.get(),
                 "frames_per_datacube": gui_instance.cube_size_var.get(),
                 "min_count": gui_instance.min_val.get(),
                 "max_count": gui_instance.max_val.get(),
@@ -808,6 +854,7 @@ class SimpleConfigManager:
             gui_instance.save_data_var.set(config.get("save_data", False))
             gui_instance.object_name_entry.delete(0, tk.END)
             gui_instance.object_name_entry.insert(0, config.get("object_name", ""))
+            gui_instance.output_path_var.set(config.get("output_path", os.getcwd()))
             gui_instance.cube_size_var.set(config.get("frames_per_datacube", 100))
             
             gui_instance.min_val.set(str(config.get("min_count", "0")))
@@ -986,10 +1033,19 @@ class CameraGUI(tk.Tk):
         self.object_name_entry = Entry(camera_controls_frame)
         self.object_name_entry.grid(row=4, column=1)
 
-        Label(camera_controls_frame, text="Frames per Datacube:").grid(row=5, column=0)
+        Label(camera_controls_frame, text="Output Directory:").grid(row=5, column=0)
+        output_path_frame = Frame(camera_controls_frame)
+        output_path_frame.grid(row=5, column=1, sticky='ew')
+        self.output_path_var = tk.StringVar(value=os.getcwd())
+        self.output_path_entry = Entry(output_path_frame, textvariable=self.output_path_var, width=20)
+        self.output_path_entry.pack(side='left', fill='x', expand=True)
+        self.browse_button = Button(output_path_frame, text="Browse...", command=self.browse_output_path)
+        self.browse_button.pack(side='left', padx=(2, 0))
+
+        Label(camera_controls_frame, text="Frames per Datacube:").grid(row=6, column=0)
         self.cube_size_var = tk.IntVar(value=100)
         self.cube_size_entry = Entry(camera_controls_frame, textvariable=self.cube_size_var)
-        self.cube_size_entry.grid(row=5, column=1)
+        self.cube_size_entry.grid(row=6, column=1)
 
     def setup_camera_settings(self):
         """Set up camera settings widgets"""
@@ -1331,6 +1387,18 @@ class CameraGUI(tk.Tk):
         except ValueError:
             self.update_status("Invalid exposure time", "red")
 
+    def browse_output_path(self):
+        """Browse for output directory"""
+        from tkinter import filedialog
+        directory = filedialog.askdirectory(
+            title="Select Output Directory",
+            initialdir=self.output_path_var.get()
+        )
+        if directory:
+            self.output_path_var.set(directory)
+            logging.info(f"Output directory set to: {directory}")
+            self.update_status(f"Output: {os.path.basename(directory)}", "green")
+
     def change_binning(self, selected_binning):
         """Change camera binning"""
         if self.camera_thread.capturing:
@@ -1462,11 +1530,18 @@ class CameraGUI(tk.Tk):
 
             # Set up save thread if needed
             if self.save_data_var.get():
-                save_queue = queue.Queue(maxsize=5000)  # Reduced from 50000 for memory safety
+                save_queue = queue.Queue(maxsize=2000)  # Reduced for tighter memory control
                 self.camera_thread.save_queue = save_queue
                 object_name = self.object_name_entry.get() or "capture"
+                output_path = self.output_path_var.get()
+                
+                # Validate output path
+                if not os.path.isdir(output_path):
+                    self.update_status(f"Invalid output path: {output_path}", "red")
+                    return
+                    
                 self.save_thread = SaveThread(save_queue, self.camera_thread, object_name,
-                                             self.shared_data, self.cube_size_var.get())
+                                             self.shared_data, self.cube_size_var.get(), output_path)
                 self.save_thread.start()
             else:
                 self.camera_thread.save_queue = None
