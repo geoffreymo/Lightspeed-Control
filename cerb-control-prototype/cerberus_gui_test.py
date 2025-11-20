@@ -17,7 +17,7 @@ from concurrent.futures import ThreadPoolExecutor
 from collections import deque
 
 # OpenCV optimizations for high-speed display
-cv2.setNumThreads(4)  # Use multiple threads for image operations
+cv2.setNumThreads(8)  # Use more threads on Threadripper for image operations
 os.environ['OPENCV_VIDEOIO_PRIORITY_MSMF'] = '0'  # Disable slow video backends
 
 # Configure logging
@@ -85,7 +85,7 @@ class CameraThread(threading.Thread):
         self.capturing = False
         self.stop_requested = threading.Event()
         self.frame_index = 0
-        self.buffer_size = 200
+        self.buffer_size = 1000  # Increased for high frame rates (0.5s at 2000 fps)
         self.save_queue = None
         self.is_connected = False
         
@@ -152,20 +152,20 @@ class CameraThread(threading.Thread):
                 if self.capturing and not self.stop_requested.is_set():
                     self.capture_frame()
                 else:
-                    time.sleep(0.1)  # Increased from 0.01 to reduce CPU when idle
+                    time.sleep(0.01)  # Short sleep to reduce CPU when idle
                     
             except Exception as e:
                 logging.error(f"Error in camera loop: {e}")
-                time.sleep(0.1)
+                time.sleep(0.001)  # 1ms sleep to avoid tight loop on errors
 
     def capture_frame(self):
         """Capture a single frame"""
         if self.stop_requested.is_set():
             return
             
-        timeout_milisec = 100
+        timeout_milisec = 10  # 10ms is sufficient for high frame rates
         
-        if not DCamLock.acquire_capture(timeout=0.1):
+        if not DCamLock.acquire_capture(timeout=0.005):  # Reduced to 5ms
             return
         
         try:
@@ -418,7 +418,7 @@ class CameraThread(threading.Thread):
 
 
 class SaveThread(threading.Thread):
-    """Save thread for writing FITS files"""
+    """Optimized save thread for high-speed FITS writing"""
     
     def __init__(self, save_queue, camera_thread, object_name, shared_data, batch_size):
         super().__init__(name="SaveThread")
@@ -427,14 +427,38 @@ class SaveThread(threading.Thread):
         self.camera_thread = camera_thread
         self.object_name = object_name
         self.batch_size = batch_size
-        self.frame_buffer = []
-        self.timestamp_buffer = []
-        self.framestamp_buffer = []
         self.cube_index = 0
         self.shared_data = shared_data
         self.save_folder = "captures"
-        self.executor = ThreadPoolExecutor(max_workers=2)
+        
+        # Preallocated buffers to avoid list append overhead
+        self.frame_buffer = None
+        self.timestamp_buffer = None
+        self.framestamp_buffer = None
+        self.buffer_index = 0
+        
+        # Performance monitoring
+        self.total_frames_saved = 0
+        self.total_frames_dropped = 0
+        self.last_fps_time = time.time()
+        self.frames_since_last_report = 0
+        
+        # Increase thread pool for parallel writes to maximize NVMe throughput
+        # With 6000 MB/s NVMe and ~16 MB frames at 120 fps = 1920 MB/s
+        # Use 6-8 workers to keep disk busy with multiple concurrent writes
+        self.executor = ThreadPoolExecutor(max_workers=8, thread_name_prefix="FITSWriter")
         self.pending_writes = []
+        
+        # Memory monitoring
+        self.max_pending_writes = 4  # Limit in-flight writes to control memory
+        
+    def preallocate_buffers(self, frame_shape, frame_dtype):
+        """Preallocate buffers based on frame size"""
+        logging.info(f"Preallocating buffers for {self.batch_size} frames of shape {frame_shape}")
+        self.frame_buffer = np.empty((self.batch_size, *frame_shape), dtype=frame_dtype)
+        self.timestamp_buffer = np.empty(self.batch_size, dtype=np.float64)
+        self.framestamp_buffer = np.empty(self.batch_size, dtype=np.int64)
+        self.buffer_index = 0
 
     def run(self):
         """Main save thread loop"""
@@ -445,96 +469,168 @@ class SaveThread(threading.Thread):
             date_str = time.strftime('%Y_%m_%d')
             self.save_folder = f"captures_{date_str}"
             os.makedirs(self.save_folder, exist_ok=True)
+            
+            # Track consecutive drops for warning escalation
+            consecutive_drops = 0
+            last_queue_warning_time = 0
 
             while self.running or not self.save_queue.empty():
                 try:
-                    frames_read = 0
-                    max_frames = min(50, self.batch_size - len(self.frame_buffer))
+                    # Limit concurrent writes to prevent memory explosion
+                    while len(self.pending_writes) >= self.max_pending_writes:
+                        self.check_pending_writes()
+                        time.sleep(0.001)  # Short sleep to avoid busy waiting
                     
-                    while frames_read < max_frames:
+                    # Pull frames from queue in batches for efficiency
+                    frames_read = 0
+                    max_batch_read = 100  # Read up to 100 frames at once
+                    
+                    while frames_read < max_batch_read and self.buffer_index < self.batch_size:
                         try:
-                            frame, timestamp, framestamp = self.save_queue.get(timeout=0.01)
-                            self.frame_buffer.append(frame)
-                            self.timestamp_buffer.append(timestamp)
-                            self.framestamp_buffer.append(framestamp)
+                            frame, timestamp, framestamp = self.save_queue.get(timeout=0.001)
+                            
+                            # Lazy buffer allocation on first frame
+                            if self.frame_buffer is None:
+                                self.preallocate_buffers(frame.shape, frame.dtype)
+                            
+                            # Copy directly into preallocated buffer (no list overhead)
+                            self.frame_buffer[self.buffer_index] = frame
+                            self.timestamp_buffer[self.buffer_index] = timestamp
+                            self.framestamp_buffer[self.buffer_index] = framestamp
+                            self.buffer_index += 1
                             frames_read += 1
+                            self.frames_since_last_report += 1
+                            consecutive_drops = 0
+                            
                         except queue.Empty:
                             break
-
-                    # Write cube when buffer is full
-                    if len(self.frame_buffer) >= self.batch_size:
-                        self.write_cube_async(start_time_filename_str)
                     
-                    # Check pending writes
+                    # Monitor queue depth and warn if getting full
+                    queue_size = self.save_queue.qsize()
+                    if queue_size > self.save_queue.maxsize * 0.8:
+                        current_time = time.time()
+                        if current_time - last_queue_warning_time > 5.0:  # Warn every 5 seconds max
+                            logging.warning(f"Save queue {queue_size}/{self.save_queue.maxsize} ({100*queue_size/self.save_queue.maxsize:.1f}% full) - disk may be falling behind!")
+                            last_queue_warning_time = current_time
+                    
+                    # Write cube when buffer is full
+                    if self.buffer_index >= self.batch_size:
+                        self.write_cube_async(start_time_filename_str)
+                        consecutive_drops = 0
+                    
+                    # Check for completed writes
                     self.check_pending_writes()
+                    
+                    # Report performance periodically
+                    self.report_performance()
                         
                 except Exception as e:
-                    logging.error(f"Save thread error: {e}")
+                    logging.error(f"Save thread error: {e}", exc_info=True)
+                    consecutive_drops += 1
+                    if consecutive_drops > 10:
+                        logging.critical("Save thread experiencing repeated errors - capture may be unstable!")
 
             # Write remaining frames
-            if self.frame_buffer:
-                self.write_cube_async(start_time_filename_str)
+            if self.buffer_index > 0:
+                logging.info(f"Writing final partial cube with {self.buffer_index} frames")
+                self.write_cube_async(start_time_filename_str, partial=True)
             
             # Wait for all pending writes
+            logging.info(f"Waiting for {len(self.pending_writes)} pending writes to complete...")
             self.wait_for_pending_writes()
+            
+            # Final statistics
+            logging.info(f"Save thread finished. Total frames saved: {self.total_frames_saved}, dropped: {self.total_frames_dropped}")
+            if self.total_frames_dropped > 0:
+                drop_rate = 100.0 * self.total_frames_dropped / (self.total_frames_saved + self.total_frames_dropped)
+                logging.warning(f"Frame drop rate: {drop_rate:.2f}%")
                 
         except Exception as e:
-            logging.error(f"Fatal save thread error: {e}")
+            logging.error(f"Fatal save thread error: {e}", exc_info=True)
         finally:
             self.cleanup()
 
-    def write_cube_async(self, start_time_filename_str):
-        """Write data cube asynchronously"""
+    def write_cube_async(self, start_time_filename_str, partial=False):
+        """Write data cube asynchronously with zero-copy approach"""
         try:
             self.cube_index += 1
             filename = f"{self.object_name}_{start_time_filename_str}_cube{self.cube_index:03d}.fits"
             filepath = os.path.join(self.save_folder, filename)
+            
+            n_frames = self.buffer_index
+            logging.info(f"Queuing cube {self.cube_index} ({n_frames} frames) for write")
 
-            logging.info(f"Queuing cube {self.cube_index} ({len(self.frame_buffer)} frames)")
-
-            frames_to_write = self.frame_buffer[:]
-            timestamps_to_write = self.timestamp_buffer[:]
-            framestamps_to_write = self.framestamp_buffer[:]
+            # Create views/slices instead of copies to save memory
+            # These are lightweight and don't duplicate data
+            if partial:
+                # For partial cubes, we need to copy the relevant portion
+                frames_to_write = self.frame_buffer[:n_frames].copy()
+                timestamps_to_write = self.timestamp_buffer[:n_frames].copy()
+                framestamps_to_write = self.framestamp_buffer[:n_frames].copy()
+            else:
+                # For full cubes, we can transfer ownership of the entire buffer
+                # This is the zero-copy approach
+                frames_to_write = self.frame_buffer
+                timestamps_to_write = self.timestamp_buffer
+                framestamps_to_write = self.framestamp_buffer
+                
+                # Allocate new buffers for next cube
+                frame_shape = self.frame_buffer.shape[1:]
+                frame_dtype = self.frame_buffer.dtype
+                self.frame_buffer = np.empty((self.batch_size, *frame_shape), dtype=frame_dtype)
+                self.timestamp_buffer = np.empty(self.batch_size, dtype=np.float64)
+                self.framestamp_buffer = np.empty(self.batch_size, dtype=np.int64)
             
             # Get camera params snapshot
             with self.shared_data.lock:
                 camera_params = dict(self.shared_data.camera_params)
             
             # Submit to thread pool
+            write_start_time = time.time()
             future = self.executor.submit(
                 self.write_fits_in_thread,
                 filepath, frames_to_write, timestamps_to_write, framestamps_to_write,
-                self.object_name, self.cube_index, camera_params
+                self.object_name, self.cube_index, camera_params, n_frames, write_start_time
             )
             
-            self.pending_writes.append((filepath, future))
+            self.pending_writes.append((filepath, future, n_frames))
+            self.total_frames_saved += n_frames
 
-            # Clear buffers
-            self.frame_buffer.clear()
-            self.timestamp_buffer.clear()
-            self.framestamp_buffer.clear()
+            # Reset buffer index
+            self.buffer_index = 0
+            
+            # Force garbage collection to free memory from completed writes
+            import gc
+            gc.collect()
             
         except Exception as e:
-            logging.error(f"Write cube error: {e}")
+            logging.error(f"Write cube error: {e}", exc_info=True)
 
     def write_fits_in_thread(self, filepath, frames, timestamps, framestamps,
-                             object_name, cube_index, camera_params):
-        """Write FITS file in thread"""
+                             object_name, cube_index, camera_params, n_frames, write_start_time):
+        """Write FITS file in thread with optimizations for speed"""
         try:
-            # Create numpy array
-            data_cube = np.array(frames)
+            start_time = time.time()
+            
+            # Frames is already a numpy array - no conversion needed!
+            # Just use it directly or create a view if it's a partial cube
+            data_cube = frames if len(frames) == n_frames else frames[:n_frames]
             
             # Create FITS HDUs
             primary_hdu = fits.PrimaryHDU()
             primary_hdu.header['OBJECT'] = (object_name, 'Object name')
             primary_hdu.header['DATE-OBS'] = (datetime.utcnow().isoformat(), 'UTC date of observation')
             primary_hdu.header['CUBEIDX'] = (cube_index, 'Cube index number')
+            primary_hdu.header['NFRAMES'] = (n_frames, 'Number of frames in cube')
 
+            # Use data_cube directly - it's already a numpy array
             image_hdu = fits.ImageHDU(data=data_cube)
             image_hdu.header['EXTNAME'] = 'DATA_CUBE'
             
-            # Add camera parameters
+            # Add camera parameters (abbreviated to reduce overhead)
             for key, value in camera_params.items():
+                if len(key) > 8:  # FITS keyword limit
+                    key = key[:8]
                 with warnings.catch_warnings():
                     warnings.filterwarnings("ignore")
                     try:
@@ -542,56 +638,115 @@ class SaveThread(threading.Thread):
                     except:
                         pass
 
-            # Create timestamp table HDU
-            col1 = fits.Column(name='TIMESTAMP', format='D', array=timestamps)
-            col2 = fits.Column(name='FRAMESTAMP', format='K', array=framestamps)
+            # Create timestamp table HDU - use views of arrays
+            timestamp_data = timestamps if len(timestamps) == n_frames else timestamps[:n_frames]
+            framestamp_data = framestamps if len(framestamps) == n_frames else framestamps[:n_frames]
+            
+            col1 = fits.Column(name='TIMESTAMP', format='D', array=timestamp_data)
+            col2 = fits.Column(name='FRAMESTAMP', format='K', array=framestamp_data)
             timestamp_hdu = fits.BinTableHDU.from_columns([col1, col2])
             timestamp_hdu.header['EXTNAME'] = 'TIMESTAMPS'
             timestamp_hdu.header['TUNIT1'] = ('seconds', 'Camera timestamp in seconds')
             timestamp_hdu.header['TUNIT2'] = ('count', 'Frame counter from camera')
 
-            # Write file
+            # Write file - this is where most time is spent
             hdulist = fits.HDUList([primary_hdu, image_hdu, timestamp_hdu])
+            
+            # Use overwrite=True to avoid checking for existing files (saves time)
             hdulist.writeto(filepath, overwrite=True)
             hdulist.close()
             
+            # Calculate write performance
+            write_time = time.time() - start_time
+            queue_wait_time = start_time - write_start_time
+            file_size_mb = os.path.getsize(filepath) / (1024 * 1024)
+            write_speed_mbps = file_size_mb / write_time if write_time > 0 else 0
+            
+            logging.info(f"Wrote {filepath} ({file_size_mb:.1f} MB) in {write_time:.2f}s ({write_speed_mbps:.1f} MB/s, queue wait: {queue_wait_time:.2f}s)")
+            
+            # Explicitly delete large objects to help garbage collector
+            del data_cube, hdulist, image_hdu, timestamp_hdu
+            
             return True
+            
         except Exception as e:
-            logging.error(f"FITS write error: {e}")
+            logging.error(f"FITS write error for {filepath}: {e}", exc_info=True)
             return False
 
     def check_pending_writes(self):
-        """Check status of pending writes"""
+        """Check status of pending writes and free memory"""
         completed = []
-        for filepath, future in self.pending_writes:
+        for filepath, future, n_frames in self.pending_writes:
             if future.done():
                 try:
-                    if future.result(timeout=0):
-                        logging.info(f"Completed writing: {filepath}")
-                    else:
+                    success = future.result(timeout=0)
+                    if not success:
                         logging.error(f"Failed writing: {filepath}")
+                        self.total_frames_dropped += n_frames
                 except Exception as e:
                     logging.error(f"Write error for {filepath}: {e}")
-                completed.append((filepath, future))
+                    self.total_frames_dropped += n_frames
+                completed.append((filepath, future, n_frames))
         
+        # Remove completed writes
         for item in completed:
             self.pending_writes.remove(item)
+        
+        # Trigger GC if we just freed significant memory
+        if len(completed) > 0:
+            import gc
+            gc.collect()
 
     def wait_for_pending_writes(self):
         """Wait for all pending writes to complete"""
-        for filepath, future in self.pending_writes:
+        total_pending = len(self.pending_writes)
+        for i, (filepath, future, n_frames) in enumerate(self.pending_writes, 1):
             try:
-                if future.result(timeout=30):
-                    logging.info(f"Final write completed: {filepath}")
+                logging.info(f"Waiting for write {i}/{total_pending}: {os.path.basename(filepath)}")
+                success = future.result(timeout=60)
+                if not success:
+                    logging.error(f"Failed final write: {filepath}")
+                    self.total_frames_dropped += n_frames
             except Exception as e:
                 logging.error(f"Final write error for {filepath}: {e}")
+                self.total_frames_dropped += n_frames
+        
+        self.pending_writes.clear()
+
+    def report_performance(self):
+        """Report save performance statistics"""
+        current_time = time.time()
+        elapsed = current_time - self.last_fps_time
+        
+        if elapsed >= 5.0:  # Report every 5 seconds
+            save_fps = self.frames_since_last_report / elapsed
+            queue_size = self.save_queue.qsize()
+            queue_pct = 100.0 * queue_size / self.save_queue.maxsize if self.save_queue.maxsize > 0 else 0
+            
+            logging.info(f"Save thread: {save_fps:.1f} fps, queue: {queue_size} ({queue_pct:.1f}%), "
+                        f"pending writes: {len(self.pending_writes)}, "
+                        f"total saved: {self.total_frames_saved}, dropped: {self.total_frames_dropped}")
+            
+            self.frames_since_last_report = 0
+            self.last_fps_time = current_time
 
     def cleanup(self):
         """Clean up resources"""
+        logging.info("Cleaning up save thread...")
         self.executor.shutdown(wait=True)
+        
+        # Clear buffers
+        self.frame_buffer = None
+        self.timestamp_buffer = None
+        self.framestamp_buffer = None
+        import gc
+        gc.collect()
+        
+        logging.info("Save thread cleanup complete")
 
     def stop(self):
         """Stop save thread"""
+        logging.info("Stop requested for save thread")
         self.running = False
 
 
@@ -1307,7 +1462,7 @@ class CameraGUI(tk.Tk):
 
             # Set up save thread if needed
             if self.save_data_var.get():
-                save_queue = queue.Queue(maxsize=50000)
+                save_queue = queue.Queue(maxsize=5000)  # Reduced from 50000 for memory safety
                 self.camera_thread.save_queue = save_queue
                 object_name = self.object_name_entry.get() or "capture"
                 self.save_thread = SaveThread(save_queue, self.camera_thread, object_name,
