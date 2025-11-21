@@ -87,6 +87,7 @@ class CameraThread(threading.Thread):
         self.buffer_size = 1000  # Increased for high frame rates (0.5s at 2000 fps)
         self.save_queue = None
         self.is_connected = False
+        self.cleanup_done = False  # Flag to prevent double cleanup
         
         # Performance monitoring
         self.frame_count = 0
@@ -417,6 +418,12 @@ class CameraThread(threading.Thread):
 
     def cleanup(self):
         """Clean up resources with safe shutdown order"""
+        # Prevent double cleanup
+        if self.cleanup_done:
+            logging.debug("Cleanup already completed, skipping")
+            return
+        
+        self.cleanup_done = True
         logging.info("Starting camera thread cleanup...")
         
         # Step 1: Signal all loops to stop
