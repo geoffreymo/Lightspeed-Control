@@ -416,7 +416,10 @@ class CameraThread(threading.Thread):
             DCamLock.release_property()
 
     def cleanup(self):
-        """Clean up resources"""
+        """Clean up resources with safe shutdown order"""
+        logging.info("Starting camera thread cleanup...")
+        
+        # Step 1: Signal all loops to stop
         self.running = False
         self.stop_requested.set()
         
@@ -431,13 +434,43 @@ class CameraThread(threading.Thread):
         if hasattr(self, '_frames_dropped_full') and self._frames_dropped_full > 0:
             logging.error(f"Queue full drops (should not happen): {self._frames_dropped_full} frames")
         
+        # Step 2: Stop capture and wait for camera operations to complete
         if self.capturing:
-            self.stop_capture()
+            logging.info("Stopping capture...")
+            try:
+                self.stop_capture()
+            except Exception as e:
+                logging.error(f"Error stopping capture: {e}")
+            
+            # Give camera thread time to exit any wait loops
+            time.sleep(0.5)
         
+        # Step 3: Close camera device with lock protection
         if self.dcam is not None:
-            self.dcam.dev_close()
-            self.dcam = None
-        Dcamapi.uninit()
+            logging.info("Closing camera device...")
+            
+            # Try to acquire lock, but proceed anyway if timeout
+            lock_acquired = DCamLock.acquire_capture(timeout=2.0)
+            
+            try:
+                self.dcam.dev_close()
+                logging.info("Camera device closed successfully")
+            except Exception as e:
+                logging.error(f"Error closing camera device: {e}")
+            finally:
+                if lock_acquired:
+                    DCamLock.release_capture()
+                self.dcam = None
+        
+        # Step 4: Uninitialize DCAM API
+        try:
+            logging.info("Uninitializing DCAM API...")
+            Dcamapi.uninit()
+            logging.info("DCAM API uninitialized successfully")
+        except Exception as e:
+            logging.error(f"Error uninitializing DCAM API: {e}")
+        
+        logging.info("Camera thread cleanup complete")
 
     def update_gui_status(self, message, color):
         """Update GUI status message"""
@@ -1719,46 +1752,71 @@ class CameraGUI(tk.Tk):
                 entry.config(state='normal')
 
     def on_close(self):
-        """Handle application close"""
+        """Handle application close with safe shutdown order"""
         try:
-            logging.info("Closing application")
-            if hasattr(self, 'config_manager'):
-                self.config_manager.save_config(self)
-                logging.info("Configuration saved on exit")
+            logging.info("=" * 60)
+            logging.info("APPLICATION SHUTDOWN INITIATED")
+            logging.info("=" * 60)
             
-            # Stop all updates
+            # Step 1: Save configuration
+            if hasattr(self, 'config_manager'):
+                try:
+                    self.config_manager.save_config(self)
+                    logging.info("✓ Configuration saved on exit")
+                except Exception as e:
+                    logging.error(f"Failed to save config: {e}")
+            
+            # Step 2: Stop GUI update loops FIRST (prevents race conditions)
+            logging.info("Stopping GUI update loops...")
             self.updating_camera_status = False
             self.updating_frame_display = False
+            time.sleep(0.3)  # Give update loops time to exit
+            logging.info("✓ GUI update loops stopped")
             
-            # Stop save thread
-            if self.save_thread and self.save_thread.is_alive():
-                logging.info("Stopping save thread")
-                self.save_thread.stop()
-                self.save_thread.join(timeout=5)
-
-            # Stop camera thread
-            if self.camera_thread:
-                logging.info("Stopping camera thread")
-                self.camera_thread.stop()
-                self.camera_thread.join(timeout=5)
-
-            # Close OpenCV windows
+            # Step 3: Close OpenCV windows BEFORE stopping camera
+            # (prevents display updates while camera is shutting down)
             try:
+                logging.info("Closing OpenCV windows...")
                 cv2.destroyAllWindows()
-                cv2.waitKey(1)
-            except:
-                pass
-
-            # Destroy GUI
-            logging.info("Destroying GUI")
+                cv2.waitKey(100)  # Longer wait for proper cleanup
+                logging.info("✓ OpenCV windows closed")
+            except Exception as e:
+                logging.error(f"Error closing OpenCV windows: {e}")
+            
+            # Step 4: Stop save thread (give it time to finish writing)
+            if self.save_thread and self.save_thread.is_alive():
+                logging.info("Stopping save thread (waiting up to 30s for file writes to complete)...")
+                self.save_thread.stop()
+                self.save_thread.join(timeout=30)
+                if self.save_thread.is_alive():
+                    logging.warning("⚠ Save thread did not stop within timeout")
+                else:
+                    logging.info("✓ Save thread stopped")
+            
+            # Step 5: Stop camera thread (give it time for proper DCAM cleanup)
+            if self.camera_thread:
+                logging.info("Stopping camera thread (waiting up to 10s)...")
+                self.camera_thread.stop()
+                self.camera_thread.join(timeout=10)
+                if self.camera_thread.is_alive():
+                    logging.warning("⚠ Camera thread did not stop within timeout")
+                else:
+                    logging.info("✓ Camera thread stopped")
+            
+            # Step 6: Destroy GUI
+            logging.info("Destroying GUI...")
             self.quit()
             self.destroy()
             
-            logging.info("Application closed successfully")
+            logging.info("=" * 60)
+            logging.info("APPLICATION CLOSED SUCCESSFULLY")
+            logging.info("=" * 60)
             
         except Exception as e:
-            logging.error(f"Error during close: {e}")
+            logging.error(f"Error during close: {e}", exc_info=True)
+            # Force exit on error to prevent hang
             import sys
+            logging.error("Forcing exit due to shutdown error")
             sys.exit(1)
 
 
