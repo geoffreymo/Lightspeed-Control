@@ -98,5 +98,8 @@ DISPLAY_PARAMS = {'SENSOR MODE': 'Sensor Mode',
                   'IMAGE PIXEL TYPE': 'Pixel Type',
                   'CONVERSION FACTOR COEFF': 'Conversion Gain (e-/ADU)',
                   'CONVERSION FACTOR OFFSET': 'Bias level',
+                  'DEFECT CORRECT MODE': 'Defect correction mode',
+                  'HOT PIXEL CORRECT LEVEL': 'Hot pixel correction level',
+                  'TIME STAMP PRODUCER': 'Time stamp producer'
                   # Add more parameters as needed
 }

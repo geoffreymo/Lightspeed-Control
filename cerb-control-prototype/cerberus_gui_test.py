@@ -8,7 +8,7 @@ import numpy as np
 import cv2
 import queue
 from astropy.io import fits
-from datetime import datetime
+from datetime import datetime, timezone
 import os
 import json
 import warnings
@@ -98,6 +98,9 @@ class CameraThread(threading.Thread):
         self.last_raw_timestamp = 0
         self.framestamp_offset = 0
         self.last_raw_framestamp = 0
+        
+        # Capture timing
+        self.capture_start_unix_time = None  # Unix time when capture actually started
 
     def run(self):
         """Main thread entry point"""
@@ -293,6 +296,9 @@ class CameraThread(threading.Thread):
             self.frame_count = 0
             self.fps_calc_time = time.time()
             
+            # Record when capture starts (for converting camera timestamps to Unix time)
+            self.capture_start_unix_time = time.time()
+            
             # Reset timestamp rollover tracking
             self.timestamp_offset = 0
             self.last_raw_timestamp = 0
@@ -312,7 +318,18 @@ class CameraThread(threading.Thread):
                 self.dcam.buf_release()
                 return False
 
+            # Record when camera is actually ready for triggers
+            capture_ready_time = time.time()
+            self.capture_ready_time = capture_ready_time
             logging.info("Capture started successfully")
+            
+            # Calculate expected PPS time if using external trigger
+            if hasattr(self, 'trigger_source') and self.trigger_source == "External":
+                # First integer second AFTER camera became ready
+                expected_pps_time = int(capture_ready_time) + 1
+                self.expected_pps_time = expected_pps_time
+                logging.info(f"Camera ready at {capture_ready_time:.6f}, expecting first PPS at {expected_pps_time:.6f} ({datetime.fromtimestamp(expected_pps_time, tz=timezone.utc).isoformat()})")
+            
             return True
             
         finally:
@@ -574,24 +591,45 @@ class SaveThread(threading.Thread):
                             
                             # Detect and log first frame
                             if self.first_frame_timestamp is None:
-                                self.first_frame_timestamp = timestamp
-                                self.timing_info['first_frame_timestamp'] = timestamp
+                                # Camera timestamp is relative (seconds since capture start)
+                                # Convert to Unix time using capture start time
+                                if hasattr(self.camera_thread, 'capture_start_unix_time') and self.camera_thread.capture_start_unix_time:
+                                    # Add camera's relative timestamp to Unix capture start time
+                                    self.first_frame_timestamp = self.camera_thread.capture_start_unix_time + timestamp
+                                else:
+                                    # Fallback if capture_start_unix_time not available
+                                    self.first_frame_timestamp = time.time()
+                                    logging.warning("Using current time as first frame timestamp (capture_start_unix_time not available)")
+                                
+                                self.timing_info['first_frame_timestamp'] = self.first_frame_timestamp
+                                
+                                # Get capture ready time and expected PPS from camera_thread
+                                if hasattr(self.camera_thread, 'capture_ready_time'):
+                                    self.timing_info['capture_ready_time'] = self.camera_thread.capture_ready_time
+                                if hasattr(self.camera_thread, 'expected_pps_time'):
+                                    self.timing_info['expected_pps_time'] = self.camera_thread.expected_pps_time
                                 
                                 if not self.first_frame_logged:
                                     self.first_frame_logged = True
-                                    logging.info(f"First frame captured at {timestamp:.6f} ({datetime.fromtimestamp(timestamp, tz=datetime.UTC).isoformat()})")
+                                    logging.info(f"First frame captured at {self.first_frame_timestamp:.6f} ({datetime.fromtimestamp(self.first_frame_timestamp, tz=timezone.utc).isoformat()})")
+                                    logging.info(f"Camera relative timestamp: {timestamp:.6f}s")
                                     
                                     # Calculate and log trigger timing if external trigger was used
-                                    if 'expected_trigger_time' in self.timing_info and self.timing_info['expected_trigger_time'] is not None:
-                                        expected = self.timing_info['expected_trigger_time']
-                                        offset = timestamp - expected
-                                        logging.info(f"Trigger timing verification: first frame at expected+{offset*1000:.2f}ms")
-                                        self.timing_info['trigger_timing_offset'] = offset
+                                    if 'expected_pps_time' in self.timing_info:
+                                        expected = self.timing_info['expected_pps_time']
+                                        offset = self.first_frame_timestamp - expected
+                                        logging.info(f"Trigger timing verification: first frame at expected PPS + {offset*1000:.2f}ms")
+                                        self.timing_info['pps_timing_offset'] = offset
                                     
-                                    # Log time from trigger_sent to first frame
+                                    # Log time from capture ready to first frame
+                                    if 'capture_ready_time' in self.timing_info:
+                                        delay = self.first_frame_timestamp - self.timing_info['capture_ready_time']
+                                        logging.info(f"Time from capture ready to first frame: {delay*1000:.2f}ms")
+                                    
+                                    # Log time from trigger_sent (button press) to first frame
                                     if 'trigger_sent_time' in self.timing_info:
-                                        delay = timestamp - self.timing_info['trigger_sent_time']
-                                        logging.info(f"Time from trigger sent to first frame: {delay*1000:.2f}ms")
+                                        total_delay = self.first_frame_timestamp - self.timing_info['trigger_sent_time']
+                                        logging.info(f"Total time from button press to first frame: {total_delay*1000:.2f}ms")
                             
                             # Lazy buffer allocation on first frame
                             if self.frame_buffer is None:
@@ -723,60 +761,47 @@ class SaveThread(threading.Thread):
             # Create FITS HDUs
             primary_hdu = fits.PrimaryHDU()
             primary_hdu.header['OBJECT'] = (object_name, 'Object name')
-            primary_hdu.header['DATE-OBS'] = (datetime.now(datetime.UTC).isoformat(), 'UTC date of observation')
+            primary_hdu.header['DATE-OBS'] = (datetime.now(timezone.utc).isoformat(), 'UTC date of observation')
             primary_hdu.header['CUBEIDX'] = (cube_index, 'Cube index number')
             primary_hdu.header['NFRAMES'] = (n_frames, 'Number of frames in cube')
             
             # Add timing information from capture start
             if 'button_press_time' in self.timing_info:
                 primary_hdu.header['BTNPRESS'] = (self.timing_info['button_press_time'], 'Unix time when Start button pressed (s)')
-                primary_hdu.header['BTNPISO'] = (datetime.fromtimestamp(self.timing_info['button_press_time'], tz=datetime.UTC).isoformat(), 
+                primary_hdu.header['BTNPISO'] = (datetime.fromtimestamp(self.timing_info['button_press_time'], tz=timezone.utc).isoformat(), 
                                                   'ISO time when Start button pressed (UTC)')
             
             if 'trigger_sent_time' in self.timing_info:
-                primary_hdu.header['TRIGSENT'] = (self.timing_info['trigger_sent_time'], 'Unix time when trigger sent to camera (s)')
-                primary_hdu.header['TRIGISO'] = (datetime.fromtimestamp(self.timing_info['trigger_sent_time'], tz=datetime.UTC).isoformat(),
-                                                  'ISO time when trigger sent (UTC)')
+                primary_hdu.header['TRIGSENT'] = (self.timing_info['trigger_sent_time'], 'Unix time when dcam.cap_start() called (s)')
+                primary_hdu.header['TRIGISO'] = (datetime.fromtimestamp(self.timing_info['trigger_sent_time'], tz=timezone.utc).isoformat(),
+                                                  'ISO time when dcam.cap_start() called')
             
-            if 'target_sync_time' in self.timing_info and self.timing_info['target_sync_time'] is not None:
-                primary_hdu.header['SYNCTARG'] = (self.timing_info['target_sync_time'], 'Target sync time (Unix seconds)')
-                primary_hdu.header['SYNCISO'] = (datetime.fromtimestamp(self.timing_info['target_sync_time'], tz=datetime.UTC).isoformat(),
-                                                  'Target sync time (UTC)')
+            # Add capture ready time (when camera actually ready for triggers)
+            if 'capture_ready_time' in self.timing_info:
+                primary_hdu.header['CAPREADY'] = (self.timing_info['capture_ready_time'], 'Unix time when capture ready (s)')
+                primary_hdu.header['CAPRDYIS'] = (datetime.fromtimestamp(self.timing_info['capture_ready_time'], tz=timezone.utc).isoformat(),
+                                                   'ISO time when capture ready (UTC)')
             
-            if 'next_integer_second' in self.timing_info and self.timing_info['next_integer_second'] is not None:
-                primary_hdu.header['NEXTSEC'] = (self.timing_info['next_integer_second'], 'Next integer second after button press')
-                primary_hdu.header['NEXTISO'] = (datetime.fromtimestamp(self.timing_info['next_integer_second'], tz=datetime.UTC).isoformat(),
-                                                  'Next integer second (UTC)')
-            
-            # Calculate and add timing deltas
-            if 'button_press_time' in self.timing_info and 'trigger_sent_time' in self.timing_info:
-                delay = self.timing_info['trigger_sent_time'] - self.timing_info['button_press_time']
-                primary_hdu.header['TRIGDLY'] = (delay, 'Delay from button press to trigger (s)')
-            
-            if 'trigger_sent_time' in self.timing_info and 'target_sync_time' in self.timing_info and self.timing_info['target_sync_time'] is not None:
-                sync_error = self.timing_info['trigger_sent_time'] - self.timing_info['target_sync_time']
-                primary_hdu.header['SYNCERR'] = (sync_error, 'Actual - target sync time (s)')
-            
-            # Add expected trigger time (for external triggers)
-            if 'expected_trigger_time' in self.timing_info and self.timing_info['expected_trigger_time'] is not None:
-                primary_hdu.header['EXPTRIG'] = (self.timing_info['expected_trigger_time'], 'Expected external trigger time (Unix s)')
-                primary_hdu.header['EXPTISO'] = (datetime.fromtimestamp(self.timing_info['expected_trigger_time'], tz=datetime.UTC).isoformat(),
-                                                  'Expected external trigger time (UTC)')
+            # Add expected PPS time (for external triggers)
+            if 'expected_pps_time' in self.timing_info:
+                primary_hdu.header['EXPPPS'] = (self.timing_info['expected_pps_time'], 'Expected PPS time (Unix s)')
+                primary_hdu.header['EXPPISIS'] = (datetime.fromtimestamp(self.timing_info['expected_pps_time'], tz=timezone.utc).isoformat(),
+                                                   'Expected PPS time (UTC)')
             
             # Add first frame timing
             if 'first_frame_timestamp' in self.timing_info:
                 primary_hdu.header['FRAME1'] = (self.timing_info['first_frame_timestamp'], 'First frame timestamp (Unix s)')
-                primary_hdu.header['FRAME1ISO'] = (datetime.fromtimestamp(self.timing_info['first_frame_timestamp'], tz=datetime.UTC).isoformat(),
+                primary_hdu.header['FRAME1IS'] = (datetime.fromtimestamp(self.timing_info['first_frame_timestamp'], tz=timezone.utc).isoformat(),
                                                     'First frame timestamp (UTC)')
                 
-                # Time from trigger sent to first frame
-                if 'trigger_sent_time' in self.timing_info:
-                    trig_to_frame = self.timing_info['first_frame_timestamp'] - self.timing_info['trigger_sent_time']
-                    primary_hdu.header['TRIG2FR'] = (trig_to_frame, 'Trigger sent to first frame delay (s)')
+                # Time from capture ready to first frame
+                if 'capture_ready_time' in self.timing_info:
+                    ready_to_frame = self.timing_info['first_frame_timestamp'] - self.timing_info['capture_ready_time']
+                    primary_hdu.header['RDY2FR'] = (ready_to_frame, 'Capture ready to first frame (s)')
                 
-                # Trigger timing offset (actual vs expected)
-                if 'trigger_timing_offset' in self.timing_info:
-                    primary_hdu.header['TRIGOFF'] = (self.timing_info['trigger_timing_offset'], 'First frame - expected trigger (s)')
+                # PPS timing offset (actual vs expected)
+                if 'pps_timing_offset' in self.timing_info:
+                    primary_hdu.header['PPSOFF'] = (self.timing_info['pps_timing_offset'], 'First frame - expected PPS (s)')
             
             # Store trigger source mode
             if 'trigger_source' in self.timing_info:
@@ -873,12 +898,14 @@ class SaveThread(threading.Thread):
         self.pending_writes.clear()
 
     def report_performance(self):
-        """Report save performance statistics"""
-        current_time = time.time()
-        elapsed = current_time - self.last_fps_time
+        """Report save performance statistics dynamically based on cube size"""
+        # Report every batch_size/5 frames (5 reports per cube)
+        report_interval = max(self.batch_size // 5, 1)  # At least report every frame if batch_size < 5
         
-        if elapsed >= 5.0:  # Report every 5 seconds
-            save_fps = self.frames_since_last_report / elapsed
+        if self.frames_since_last_report >= report_interval:
+            current_time = time.time()
+            elapsed = current_time - self.last_fps_time
+            save_fps = self.frames_since_last_report / elapsed if elapsed > 0 else 0
             queue_size = self.save_queue.qsize()
             queue_pct = 100.0 * queue_size / self.save_queue.maxsize if self.save_queue.maxsize > 0 else 0
             
@@ -1666,56 +1693,14 @@ class CameraGUI(tk.Tk):
             
             self.update_status("Starting capture...", "blue")
             
-            # Initialize timing variables
-            trigger_sent_time = None
-            target_sync_time = None
+            # Start capture immediately (no artificial delay)
+            trigger_sent_time = time.time()
+            logging.info(f"Button pressed at {button_press_time:.6f}, initializing camera at {trigger_sent_time:.6f}")
             
-            # Timing synchronization logic for external trigger
-            if self.sync_to_second_var.get() and self.trigger_source_var.get() == "External":
-                current_time = time.time()
-                current_fractional = current_time - int(current_time)
-                
-                # Calculate target sync time (next integer second + random offset)
-                next_integer_second = int(current_time) + 1
-                random_offset = 0.1 + (time.time() % 1.0) * 0.1  # Pseudo-random using fractional time
-                target_sync_time = next_integer_second + random_offset
-                
-                # Wait until next integer second, then add random delay
-                if current_fractional > 0:
-                    wait_to_next_second = 1.0 - current_fractional
-                else:
-                    wait_to_next_second = 0.0
-                
-                total_wait = wait_to_next_second + random_offset
-                
-                # Show countdown
-                self.sync_status_label.config(
-                    text=f"Syncing to {time.strftime('%H:%M:%S', time.localtime(target_sync_time))}.{int(random_offset*1000):03d}..."
-                )
-                logging.info(f"Button pressed at {button_press_time:.6f}, waiting {total_wait:.3f}s to sync to {target_sync_time:.6f}")
-                
-                # Wait with periodic status updates
-                wait_start = time.time()
-                while time.time() - wait_start < total_wait:
-                    remaining = total_wait - (time.time() - wait_start)
-                    if remaining > 0:
-                        self.update_status(f"Syncing in {remaining:.2f}s...", "blue")
-                        time.sleep(0.05)
-                
-                trigger_sent_time = time.time()
-                self.sync_status_label.config(
-                    text=f"Started at {time.strftime('%H:%M:%S', time.localtime(trigger_sent_time))}.{int((trigger_sent_time % 1)*1000):03d}"
-                )
-                
-                # Expected trigger time is the next integer second after trigger_sent_time
-                expected_trigger_time = int(trigger_sent_time) + 1
-                logging.info(f"Trigger sent at {trigger_sent_time:.6f} (target was {target_sync_time:.6f}, offset: {(trigger_sent_time - target_sync_time)*1000:.2f}ms)")
-                logging.info(f"Expected first external trigger at {expected_trigger_time:.6f} ({datetime.fromtimestamp(expected_trigger_time, tz=datetime.UTC).isoformat()})")
-            else:
-                # No sync - trigger sent immediately
-                trigger_sent_time = time.time()
-                expected_trigger_time = None  # No expected trigger for internal/software triggering
-                logging.info(f"Trigger sent immediately at {trigger_sent_time:.6f} (button press: {button_press_time:.6f})")
+            # Store trigger info for later (will calculate expected PPS after camera ready)
+            self.camera_thread.button_press_time = button_press_time
+            self.camera_thread.trigger_sent_time = trigger_sent_time
+            self.camera_thread.trigger_source = self.trigger_source_var.get()
 
             # Set up save thread if needed
             if self.save_data_var.get():
@@ -1729,14 +1714,12 @@ class CameraGUI(tk.Tk):
                     self.update_status(f"Invalid output path: {output_path}", "red")
                     return
                 
-                # Pass timing information to SaveThread
+                # Pass basic timing information to SaveThread
+                # Expected PPS will be calculated after camera initialization completes
                 timing_info = {
                     'button_press_time': button_press_time,
                     'trigger_sent_time': trigger_sent_time,
-                    'target_sync_time': target_sync_time,  # None if sync disabled
-                    'next_integer_second': int(button_press_time) + 1 if target_sync_time else None,
-                    'expected_trigger_time': expected_trigger_time,  # Expected external PPS arrival
-                    'trigger_source': self.trigger_source_var.get()  # Store trigger mode
+                    'trigger_source': self.trigger_source_var.get()
                 }
                     
                 self.save_thread = SaveThread(save_queue, self.camera_thread, object_name,
