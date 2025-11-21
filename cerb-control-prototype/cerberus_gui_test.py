@@ -8,7 +8,7 @@ import numpy as np
 import cv2
 import queue
 from astropy.io import fits
-from datetime import datetime, timezone
+from datetime import datetime
 import os
 import json
 import warnings
@@ -74,11 +74,10 @@ class SharedData:
 class CameraThread(threading.Thread):
     """Camera control thread"""
     
-    def __init__(self, shared_data, frame_queue, timestamp_queue, gui_ref):
+    def __init__(self, shared_data, frame_queue, gui_ref):
         super().__init__(name="CameraThread")
         self.shared_data = shared_data
         self.frame_queue = frame_queue
-        self.timestamp_queue = timestamp_queue
         self.gui_ref = gui_ref
         self.dcam = None
         self.running = True
@@ -221,12 +220,6 @@ class CameraThread(threading.Thread):
             self.frame_queue.put_nowait(frame)
         except queue.Full:
             pass
-        
-        # Queue timestamp for saving
-        try:
-            self.timestamp_queue.put_nowait((corrected_timestamp, corrected_framestamp))
-        except queue.Full:
-            logging.warning("Timestamp queue full - dropping timestamp")
         
         # Queue for saving if enabled
         if self.save_queue is not None:
@@ -461,7 +454,7 @@ class CameraThread(threading.Thread):
 class SaveThread(threading.Thread):
     """Optimized save thread for high-speed FITS writing"""
     
-    def __init__(self, save_queue, camera_thread, object_name, shared_data, batch_size, base_path=None):
+    def __init__(self, save_queue, camera_thread, object_name, shared_data, batch_size, base_path=None, timing_info=None):
         super().__init__(name="SaveThread")
         self.save_queue = save_queue
         self.running = True
@@ -472,6 +465,7 @@ class SaveThread(threading.Thread):
         self.shared_data = shared_data
         self.base_path = base_path or os.getcwd()  # Use provided path or current directory
         self.save_folder = "captures"
+        self.timing_info = timing_info or {}  # Store timing information for FITS headers
         
         # Preallocated buffers to avoid list append overhead
         self.frame_buffer = None
@@ -664,9 +658,39 @@ class SaveThread(threading.Thread):
             # Create FITS HDUs
             primary_hdu = fits.PrimaryHDU()
             primary_hdu.header['OBJECT'] = (object_name, 'Object name')
-            primary_hdu.header['DATE-OBS'] = (datetime.now(timezone.utc).isoformat(), 'UTC date of observation')
+            primary_hdu.header['DATE-OBS'] = (datetime.now(datetime.UTC).isoformat(), 'UTC date of observation')
             primary_hdu.header['CUBEIDX'] = (cube_index, 'Cube index number')
             primary_hdu.header['NFRAMES'] = (n_frames, 'Number of frames in cube')
+            
+            # Add timing information from capture start
+            if 'button_press_time' in self.timing_info:
+                primary_hdu.header['BTNPRESS'] = (self.timing_info['button_press_time'], 'Unix time when Start button pressed (s)')
+                primary_hdu.header['BTNPISO'] = (datetime.fromtimestamp(self.timing_info['button_press_time'], tz=datetime.UTC).isoformat(), 
+                                                  'ISO time when Start button pressed (UTC)')
+            
+            if 'trigger_sent_time' in self.timing_info:
+                primary_hdu.header['TRIGSENT'] = (self.timing_info['trigger_sent_time'], 'Unix time when trigger sent to camera (s)')
+                primary_hdu.header['TRIGISO'] = (datetime.fromtimestamp(self.timing_info['trigger_sent_time'], tz=datetime.UTC).isoformat(),
+                                                  'ISO time when trigger sent (UTC)')
+            
+            if 'target_sync_time' in self.timing_info and self.timing_info['target_sync_time'] is not None:
+                primary_hdu.header['SYNCTARG'] = (self.timing_info['target_sync_time'], 'Target sync time (Unix seconds)')
+                primary_hdu.header['SYNCISO'] = (datetime.fromtimestamp(self.timing_info['target_sync_time'], tz=datetime.UTC).isoformat(),
+                                                  'Target sync time (UTC)')
+            
+            if 'next_integer_second' in self.timing_info and self.timing_info['next_integer_second'] is not None:
+                primary_hdu.header['NEXTSEC'] = (self.timing_info['next_integer_second'], 'Next integer second after button press')
+                primary_hdu.header['NEXTISO'] = (datetime.fromtimestamp(self.timing_info['next_integer_second'], tz=datetime.UTC).isoformat(),
+                                                  'Next integer second (UTC)')
+            
+            # Calculate and add timing deltas
+            if 'button_press_time' in self.timing_info and 'trigger_sent_time' in self.timing_info:
+                delay = self.timing_info['trigger_sent_time'] - self.timing_info['button_press_time']
+                primary_hdu.header['TRIGDLY'] = (delay, 'Delay from button press to trigger (s)')
+            
+            if 'trigger_sent_time' in self.timing_info and 'target_sync_time' in self.timing_info and self.timing_info['target_sync_time'] is not None:
+                sync_error = self.timing_info['trigger_sent_time'] - self.timing_info['target_sync_time']
+                primary_hdu.header['SYNCERR'] = (sync_error, 'Actual - target sync time (s)')
 
             # Use data_cube directly - it's already a numpy array
             image_hdu = fits.ImageHDU(data=data_cube)
@@ -811,6 +835,9 @@ class SimpleConfigManager:
                 "readout_speed": gui_instance.readout_speed_var.get(),
                 "sensor_mode": gui_instance.sensor_mode_var.get(),
                 "subarray_mode": gui_instance.subarray_mode_var.get(),
+                "trigger_source": gui_instance.trigger_source_var.get(),
+                "trigger_mode": gui_instance.trigger_mode_var.get(),
+                "sync_to_second": gui_instance.sync_to_second_var.get(),
                 "save_data": gui_instance.save_data_var.get(),
                 "object_name": gui_instance.object_name_entry.get(),
                 "output_path": gui_instance.output_path_var.get(),
@@ -850,6 +877,9 @@ class SimpleConfigManager:
             gui_instance.readout_speed_var.set(config.get("readout_speed", "Ultra Quiet Mode"))
             gui_instance.sensor_mode_var.set(config.get("sensor_mode", "Standard"))
             gui_instance.subarray_mode_var.set(config.get("subarray_mode", "Off"))
+            gui_instance.trigger_source_var.set(config.get("trigger_source", "Internal"))
+            gui_instance.trigger_mode_var.set(config.get("trigger_mode", "Normal"))
+            gui_instance.sync_to_second_var.set(config.get("sync_to_second", True))
             
             gui_instance.save_data_var.set(config.get("save_data", False))
             gui_instance.object_name_entry.delete(0, tk.END)
@@ -885,12 +915,11 @@ class SimpleConfigManager:
 class CameraGUI(tk.Tk):
     """Main GUI application"""
     
-    def __init__(self, shared_data, camera_thread, frame_queue, timestamp_queue):
+    def __init__(self, shared_data, camera_thread, frame_queue):
         super().__init__()
         self.shared_data = shared_data
         self.camera_thread = camera_thread
         self.frame_queue = frame_queue
-        self.timestamp_queue = timestamp_queue
         self.updating_camera_status = True
         self.updating_frame_display = True
         self.save_thread = None
@@ -1091,6 +1120,22 @@ class CameraGUI(tk.Tk):
                                             "Normal", "Start",
                                             command=self.change_trigger_mode)
         self.trigger_mode_menu.grid(row=5, column=1)
+
+        # Timing synchronization for external trigger
+        timing_frame = LabelFrame(camera_settings_frame, text="Timing Sync", padx=5, pady=2)
+        timing_frame.grid(row=6, column=0, columnspan=2, sticky='ew', pady=(10, 0))
+        
+        self.sync_to_second_var = tk.BooleanVar(value=True)
+        self.sync_to_second_checkbox = Checkbutton(
+            timing_frame, 
+            text="Sync start to next integer second\n(for external PPS trigger)",
+            variable=self.sync_to_second_var,
+            justify=tk.LEFT
+        )
+        self.sync_to_second_checkbox.pack(anchor='w')
+        
+        self.sync_status_label = tk.Label(timing_frame, text="", font=("Courier", 9), fg="blue")
+        self.sync_status_label.pack(anchor='w')
 
     def setup_subarray_controls(self):
         """Set up subarray control widgets"""
@@ -1526,7 +1571,56 @@ class CameraGUI(tk.Tk):
     def start_capture(self):
         """Start camera capture"""
         try:
+            # Record button press time immediately
+            button_press_time = time.time()
+            
             self.update_status("Starting capture...", "blue")
+            
+            # Initialize timing variables
+            trigger_sent_time = None
+            target_sync_time = None
+            
+            # Timing synchronization logic for external trigger
+            if self.sync_to_second_var.get() and self.trigger_source_var.get() == "External":
+                current_time = time.time()
+                current_fractional = current_time - int(current_time)
+                
+                # Calculate target sync time (next integer second + random offset)
+                next_integer_second = int(current_time) + 1
+                random_offset = 0.1 + (time.time() % 1.0) * 0.1  # Pseudo-random using fractional time
+                target_sync_time = next_integer_second + random_offset
+                
+                # Wait until next integer second, then add random delay
+                if current_fractional > 0:
+                    wait_to_next_second = 1.0 - current_fractional
+                else:
+                    wait_to_next_second = 0.0
+                
+                total_wait = wait_to_next_second + random_offset
+                
+                # Show countdown
+                self.sync_status_label.config(
+                    text=f"Syncing to {time.strftime('%H:%M:%S', time.localtime(target_sync_time))}.{int(random_offset*1000):03d}..."
+                )
+                logging.info(f"Button pressed at {button_press_time:.6f}, waiting {total_wait:.3f}s to sync to {target_sync_time:.6f}")
+                
+                # Wait with periodic status updates
+                wait_start = time.time()
+                while time.time() - wait_start < total_wait:
+                    remaining = total_wait - (time.time() - wait_start)
+                    if remaining > 0:
+                        self.update_status(f"Syncing in {remaining:.2f}s...", "blue")
+                        time.sleep(0.05)
+                
+                trigger_sent_time = time.time()
+                self.sync_status_label.config(
+                    text=f"Started at {time.strftime('%H:%M:%S', time.localtime(trigger_sent_time))}.{int((trigger_sent_time % 1)*1000):03d}"
+                )
+                logging.info(f"Trigger sent at {trigger_sent_time:.6f} (target was {target_sync_time:.6f}, offset: {(trigger_sent_time - target_sync_time)*1000:.2f}ms)")
+            else:
+                # No sync - trigger sent immediately
+                trigger_sent_time = time.time()
+                logging.info(f"Trigger sent immediately at {trigger_sent_time:.6f} (button press: {button_press_time:.6f})")
 
             # Set up save thread if needed
             if self.save_data_var.get():
@@ -1539,9 +1633,17 @@ class CameraGUI(tk.Tk):
                 if not os.path.isdir(output_path):
                     self.update_status(f"Invalid output path: {output_path}", "red")
                     return
+                
+                # Pass timing information to SaveThread
+                timing_info = {
+                    'button_press_time': button_press_time,
+                    'trigger_sent_time': trigger_sent_time,
+                    'target_sync_time': target_sync_time,  # None if sync disabled
+                    'next_integer_second': int(button_press_time) + 1 if target_sync_time else None
+                }
                     
                 self.save_thread = SaveThread(save_queue, self.camera_thread, object_name,
-                                             self.shared_data, self.cube_size_var.get(), output_path)
+                                             self.shared_data, self.cube_size_var.get(), output_path, timing_info)
                 self.save_thread.start()
             else:
                 self.camera_thread.save_queue = None
@@ -1668,13 +1770,12 @@ def main():
         # Create shared resources
         shared_data = SharedData()
         frame_queue = queue.Queue(maxsize=5)
-        timestamp_queue = queue.Queue(maxsize=100000)
         
         # Create GUI
-        app = CameraGUI(shared_data, None, frame_queue, timestamp_queue)
+        app = CameraGUI(shared_data, None, frame_queue)
         
         # Create and start camera thread
-        camera_thread = CameraThread(shared_data, frame_queue, timestamp_queue, app)
+        camera_thread = CameraThread(shared_data, frame_queue, app)
         camera_thread.daemon = True
         camera_thread.start()
         
