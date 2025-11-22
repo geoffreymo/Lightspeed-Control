@@ -430,6 +430,14 @@ class CameraThread(threading.Thread):
                             valuetext = self.dcam.prop_getvaluetext(idprop, propvalue)
                             self.shared_data.camera_params[propname] = valuetext or propvalue
                     idprop = self.dcam.prop_getnextid(idprop)
+                
+                # Log all available properties once for debugging
+                if not hasattr(self, '_logged_all_props'):
+                    self._logged_all_props = True
+                    logging.info("=== ALL AVAILABLE CAMERA PROPERTIES ===")
+                    for prop_name in sorted(self.shared_data.camera_params.keys()):
+                        logging.info(f"  {prop_name}: {self.shared_data.camera_params[prop_name]}")
+                    logging.info("=== END CAMERA PROPERTIES ===")
         finally:
             DCamLock.release_property()
 
@@ -954,6 +962,8 @@ class SimpleConfigManager:
                 "subarray_mode": gui_instance.subarray_mode_var.get(),
                 "trigger_source": gui_instance.trigger_source_var.get(),
                 "trigger_mode": gui_instance.trigger_mode_var.get(),
+                "defect_correct": gui_instance.defect_correct_var.get(),
+                "hot_pixel_level": gui_instance.hot_pixel_level_var.get(),
                 "save_data": gui_instance.save_data_var.get(),
                 "object_name": gui_instance.object_name_entry.get(),
                 "output_path": gui_instance.output_path_var.get(),
@@ -995,6 +1005,8 @@ class SimpleConfigManager:
             gui_instance.subarray_mode_var.set(config.get("subarray_mode", "Off"))
             gui_instance.trigger_source_var.set(config.get("trigger_source", "Internal"))
             gui_instance.trigger_mode_var.set(config.get("trigger_mode", "Normal"))
+            gui_instance.defect_correct_var.set(config.get("defect_correct", "ON"))
+            gui_instance.hot_pixel_level_var.set(config.get("hot_pixel_level", "STANDARD"))
             
             gui_instance.save_data_var.set(config.get("save_data", False))
             gui_instance.object_name_entry.delete(0, tk.END)
@@ -1235,6 +1247,21 @@ class CameraGUI(tk.Tk):
                                             "Normal", "Start",
                                             command=self.change_trigger_mode)
         self.trigger_mode_menu.grid(row=5, column=1)
+        
+        # Defect correction controls
+        Label(camera_settings_frame, text="Defect Correction:").grid(row=6, column=0)
+        self.defect_correct_var = StringVar(value="ON")
+        self.defect_correct_menu = OptionMenu(camera_settings_frame, self.defect_correct_var,
+                                              "OFF", "ON",
+                                              command=self.change_defect_correct)
+        self.defect_correct_menu.grid(row=6, column=1)
+        
+        Label(camera_settings_frame, text="Hot Pixel Level:").grid(row=7, column=0)
+        self.hot_pixel_level_var = StringVar(value="STANDARD")
+        self.hot_pixel_level_menu = OptionMenu(camera_settings_frame, self.hot_pixel_level_var,
+                                               "STANDARD", "MINIMUM", "AGGRESSIVE",
+                                               command=self.change_hot_pixel_level)
+        self.hot_pixel_level_menu.grid(row=7, column=1)
 
     def setup_subarray_controls(self):
         """Set up subarray control widgets"""
@@ -1604,6 +1631,26 @@ class CameraGUI(tk.Tk):
         trigger_mode_value = {"Normal": 1.0, "Start": 6.0}[selected_mode]
         self.camera_thread.set_property('TRIGGER_MODE', trigger_mode_value)
         self.update_status(f"Trigger mode: {selected_mode}", "green")
+    
+    def change_defect_correct(self, selected_mode):
+        """Change defect correction mode"""
+        if self.camera_thread.capturing:
+            self.update_status("Cannot change during capture", "orange")
+            return
+        
+        defect_mode_value = {"OFF": 1.0, "ON": 2.0}[selected_mode]
+        self.camera_thread.set_property('DEFECT_CORRECT_MODE', defect_mode_value)
+        self.update_status(f"Defect correction: {selected_mode}", "green")
+    
+    def change_hot_pixel_level(self, selected_level):
+        """Change hot pixel correction level"""
+        if self.camera_thread.capturing:
+            self.update_status("Cannot change during capture", "orange")
+            return
+        
+        level_value = {"STANDARD": 1.0, "MINIMUM": 2.0, "AGGRESSIVE": 3.0}[selected_level]
+        self.camera_thread.set_property('HOT_PIXEL_CORRECT_LEVEL', level_value)
+        self.update_status(f"Hot pixel level: {selected_level}", "green")
 
     def change_output_trigger_kind(self, selected_kind):
         """Change output trigger kind"""
