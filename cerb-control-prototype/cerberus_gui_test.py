@@ -313,6 +313,21 @@ class CameraThread(threading.Thread):
             except Exception as e:
                 logging.error(f"Error setting timestamp producer: {e}")
 
+            # Wait to sync dcam.cap_start() to 50ms after an integer second
+            current_time = time.time()
+            time_in_second = current_time - int(current_time)  # Fractional part (0.0 to 1.0)
+            target_offset = 0.050  # 50ms after integer second
+            
+            if time_in_second < target_offset:
+                # We're before the target, wait for it in this second
+                wait_time = target_offset - time_in_second
+            else:
+                # We're past the target, wait for it in the next second
+                wait_time = (1.0 - time_in_second) + target_offset
+            
+            logging.info(f"Syncing: waiting {wait_time*1000:.1f}ms to align dcam.cap_start() to 50ms after integer second")
+            time.sleep(wait_time)
+            
             # Record time immediately before starting camera
             time_before_cap_start = time.time()
             
@@ -331,7 +346,11 @@ class CameraThread(threading.Thread):
             self.time_after_cap_start = time_after_cap_start
             
             cap_start_duration = time_after_cap_start - time_before_cap_start
+            next_integer_second = int(time_after_cap_start) + 1
+            
             logging.info(f"Capture started successfully (dcam.cap_start took {cap_start_duration*1000:.2f}ms)")
+            logging.info(f"cap_start finished at {time_after_cap_start:.6f} ({datetime.fromtimestamp(time_after_cap_start, tz=timezone.utc).isoformat()})")
+            logging.info(f"Next integer second: {next_integer_second:.6f} ({datetime.fromtimestamp(next_integer_second, tz=timezone.utc).isoformat()})")
             
             return True
             
