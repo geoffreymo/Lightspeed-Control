@@ -98,9 +98,6 @@ class CameraThread(threading.Thread):
         self.last_raw_timestamp = 0
         self.framestamp_offset = 0
         self.last_raw_framestamp = 0
-        
-        # Capture timing
-        self.capture_start_unix_time = None  # Unix time when capture actually started
 
     def run(self):
         """Main thread entry point"""
@@ -138,6 +135,10 @@ class CameraThread(threading.Thread):
                 self.update_camera_params()
                 self.is_connected = True
                 self.update_gui_status("Camera connected", "green")
+                
+                # Perform warmup capture to initialize camera hardware
+                self.warmup_capture()
+                
                 return True
                 
             except Exception as e:
@@ -296,9 +297,6 @@ class CameraThread(threading.Thread):
             self.frame_count = 0
             self.fps_calc_time = time.time()
             
-            # Record when capture starts (for converting camera timestamps to Unix time)
-            self.capture_start_unix_time = time.time()
-            
             # Reset timestamp rollover tracking
             self.timestamp_offset = 0
             self.last_raw_timestamp = 0
@@ -311,6 +309,9 @@ class CameraThread(threading.Thread):
             except Exception as e:
                 logging.error(f"Error setting timestamp producer: {e}")
 
+            # Record time immediately before starting camera
+            time_before_cap_start = time.time()
+            
             # Start capture
             if not self.dcam.cap_start():
                 logging.error("Failed to start capture")
@@ -318,17 +319,22 @@ class CameraThread(threading.Thread):
                 self.dcam.buf_release()
                 return False
 
-            # Record when camera is actually ready for triggers
-            capture_ready_time = time.time()
-            self.capture_ready_time = capture_ready_time
+            # Record time immediately after cap_start returns
+            time_after_cap_start = time.time()
+            
+            # Store these times
+            self.time_before_cap_start = time_before_cap_start
+            self.time_after_cap_start = time_after_cap_start
+            
+            logging.info(f"dcam.cap_start() took {(time_after_cap_start - time_before_cap_start)*1000:.2f}ms")
             logging.info("Capture started successfully")
             
             # Calculate expected PPS time if using external trigger
             if hasattr(self, 'trigger_source') and self.trigger_source == "External":
-                # First integer second AFTER camera became ready
-                expected_pps_time = int(capture_ready_time) + 1
+                # First integer second AFTER cap_start completed
+                expected_pps_time = int(time_after_cap_start) + 1
                 self.expected_pps_time = expected_pps_time
-                logging.info(f"Camera ready at {capture_ready_time:.6f}, expecting first PPS at {expected_pps_time:.6f} ({datetime.fromtimestamp(expected_pps_time, tz=timezone.utc).isoformat()})")
+                logging.info(f"Expecting first PPS at {expected_pps_time:.6f} ({datetime.fromtimestamp(expected_pps_time, tz=timezone.utc).isoformat()})")
             
             return True
             
@@ -374,18 +380,67 @@ class CameraThread(threading.Thread):
         logging.info("Setting default camera parameters")
         defaults = {
             'READOUT_SPEED': 1.0,
-            'EXPOSURE_TIME': 0.1,
-            'TRIGGER_SOURCE': 1.0,  # 1=Internal, 2=External, 3=Software
-            'TRIGGER_MODE': 1.0,    # 1=Normal, 6=Start
+            'EXPOSURE_TIME': 1.0,  # 1 second exposure time
+            'TRIGGER_SOURCE': 2.0,  # 2=External (1=Internal, 3=Software)
+            'TRIGGER_MODE': 6.0,    # 1=Normal, 6=Start
             'OUTPUT_TRIG_KIND_0': 3.0,    # 1=Ready, 2=Exposure, 3=Programmable, 4=Global
             'OUTPUT_TRIG_ACTIVE_0': 1.0,   # Enable output trigger
             'OUTPUT_TRIG_POLARITY_0': 1.0, # 1=Positive, 2=Negative
             'OUTPUT_TRIG_PERIOD_0': 10.0,  # Period in seconds
             'SENSOR_MODE': 1.0,
-            'IMAGE_PIXEL_TYPE': 2.0
+            'IMAGE_PIXEL_TYPE': 2.0,
+            'DEFECTCORRECT_MODE': 1.0,  # 1=OFF, 2=ON
+            'HOTPIXELCORRECT_LEVEL': 2.0  # 1=STANDARD, 2=MINIMUM, 3=AGGRESSIVE
         }
         for prop, value in defaults.items():
             self.set_property(prop, value)
+
+    def warmup_capture(self):
+        """Perform a quick warmup capture to initialize camera hardware
+        
+        This avoids the long 3+ second delay on first real capture by
+        initializing the camera's internal state ahead of time.
+        """
+        logging.info("Performing warmup capture to initialize camera hardware...")
+        
+        if not DCamLock.acquire_capture(timeout=3.0):
+            logging.warning("Could not acquire lock for warmup capture")
+            return
+        
+        try:
+            if self.dcam is None:
+                return
+            
+            # Allocate minimal buffer (just 1 frame)
+            if not self.dcam.buf_alloc(1):
+                logging.warning("Warmup: Buffer allocation failed")
+                return
+            
+            # Start capture (this is what takes 3+ seconds the first time)
+            warmup_start = time.time()
+            if not self.dcam.cap_start():
+                logging.warning("Warmup: cap_start failed")
+                self.dcam.buf_release()
+                return
+            
+            warmup_duration = time.time() - warmup_start
+            logging.info(f"Warmup: cap_start took {warmup_duration*1000:.2f}ms")
+            
+            # Immediately stop - we don't need to capture any frames
+            time.sleep(0.01)  # Brief delay to let camera settle
+            
+            if not self.dcam.cap_stop():
+                logging.warning("Warmup: cap_stop failed")
+            
+            if not self.dcam.buf_release():
+                logging.warning("Warmup: buf_release failed")
+            
+            logging.info("Warmup capture complete - camera is now initialized")
+            
+        except Exception as e:
+            logging.error(f"Error during warmup capture: {e}")
+        finally:
+            DCamLock.release_capture()
 
     def set_property(self, prop_name, value):
         """Set camera property"""
@@ -599,44 +654,73 @@ class SaveThread(threading.Thread):
                             
                             # Detect and log first frame
                             if self.first_frame_timestamp is None:
-                                # Camera timestamp is relative (seconds since capture start)
-                                # Convert to Unix time using capture start time
-                                if hasattr(self.camera_thread, 'capture_start_unix_time') and self.camera_thread.capture_start_unix_time:
-                                    # Add camera's relative timestamp to Unix capture start time
-                                    self.first_frame_timestamp = self.camera_thread.capture_start_unix_time + timestamp
-                                else:
-                                    # Fallback if capture_start_unix_time not available
-                                    self.first_frame_timestamp = time.time()
-                                    logging.warning("Using current time as first frame timestamp (capture_start_unix_time not available)")
+                                # Record time immediately when first frame arrives
+                                time_first_frame_arrived = time.time()
                                 
-                                self.timing_info['first_frame_timestamp'] = self.first_frame_timestamp
+                                # Store camera's relative timestamp
+                                self.first_frame_timestamp = timestamp
+                                self.timing_info['first_frame_timestamp'] = timestamp
+                                self.timing_info['time_first_frame_arrived'] = time_first_frame_arrived
                                 
-                                # Get capture ready time and expected PPS from camera_thread
-                                if hasattr(self.camera_thread, 'capture_ready_time'):
-                                    self.timing_info['capture_ready_time'] = self.camera_thread.capture_ready_time
+                                # Get timing from camera_thread
+                                if hasattr(self.camera_thread, 'time_before_cap_start'):
+                                    self.timing_info['time_before_cap_start'] = self.camera_thread.time_before_cap_start
+                                if hasattr(self.camera_thread, 'time_after_cap_start'):
+                                    self.timing_info['time_after_cap_start'] = self.camera_thread.time_after_cap_start
                                 if hasattr(self.camera_thread, 'expected_pps_time'):
                                     self.timing_info['expected_pps_time'] = self.camera_thread.expected_pps_time
                                 
+                                # Get readout time from camera
+                                readout_time = None
+                                if hasattr(self.camera_thread, 'dcam') and self.camera_thread.dcam is not None:
+                                    try:
+                                        # TIMING_READOUTTIME property ID is 0x00403010
+                                        readout_time = self.camera_thread.dcam.prop_getvalue(0x00403010)
+                                        if readout_time is not False:
+                                            self.timing_info['readout_time'] = readout_time
+                                    except:
+                                        pass
+                                
+                                # Calculate estimated trigger arrival time
+                                if 'exposure_time' in self.timing_info and readout_time is not None:
+                                    # Frame arrived at T_FRAME1
+                                    # Trigger arrived at: T_FRAME1 - exposure_time - readout_time
+                                    exposure_time = self.timing_info['exposure_time']
+                                    estimated_trigger_arrival = time_first_frame_arrived - exposure_time - readout_time
+                                    self.timing_info['estimated_trigger_arrival'] = estimated_trigger_arrival
+                                
                                 if not self.first_frame_logged:
                                     self.first_frame_logged = True
-                                    logging.info(f"First frame captured at {self.first_frame_timestamp:.6f} ({datetime.fromtimestamp(self.first_frame_timestamp, tz=timezone.utc).isoformat()})")
-                                    logging.info(f"Camera relative timestamp: {timestamp:.6f}s")
+                                    logging.info(f"First frame arrived at system time {time_first_frame_arrived:.6f} ({datetime.fromtimestamp(time_first_frame_arrived, tz=timezone.utc).isoformat()})")
+                                    logging.info(f"First frame camera timestamp: {timestamp:.6f}s (camera-relative)")
                                     
-                                    # Calculate and log trigger timing if external trigger was used
-                                    if 'expected_pps_time' in self.timing_info:
-                                        expected = self.timing_info['expected_pps_time']
-                                        offset = self.first_frame_timestamp - expected
-                                        logging.info(f"Trigger timing verification: first frame at expected PPS + {offset*1000:.2f}ms")
-                                        self.timing_info['pps_timing_offset'] = offset
+                                    # Log exposure and readout times
+                                    if 'exposure_time' in self.timing_info:
+                                        logging.info(f"Exposure time: {self.timing_info['exposure_time']*1000:.3f}ms")
+                                    if 'readout_time' in self.timing_info:
+                                        logging.info(f"Readout time: {self.timing_info['readout_time']*1000:.3f}ms")
                                     
-                                    # Log time from capture ready to first frame
-                                    if 'capture_ready_time' in self.timing_info:
-                                        delay = self.first_frame_timestamp - self.timing_info['capture_ready_time']
-                                        logging.info(f"Time from capture ready to first frame: {delay*1000:.2f}ms")
+                                    # Log estimated trigger arrival
+                                    if 'estimated_trigger_arrival' in self.timing_info:
+                                        est_trigger = self.timing_info['estimated_trigger_arrival']
+                                        logging.info(f"Estimated trigger arrival: {est_trigger:.6f} ({datetime.fromtimestamp(est_trigger, tz=timezone.utc).isoformat()})")
+                                        
+                                        # Compare to expected PPS
+                                        if 'expected_pps_time' in self.timing_info:
+                                            expected = self.timing_info['expected_pps_time']
+                                            offset = est_trigger - expected
+                                            logging.info(f"Trigger offset from expected PPS: {offset*1000:.2f}ms")
                                     
-                                    # Log time from trigger_sent (button press) to first frame
+                                    # Log delays
+                                    if 'time_before_cap_start' in self.timing_info and 'time_after_cap_start' in self.timing_info:
+                                        cap_start_duration = self.timing_info['time_after_cap_start'] - self.timing_info['time_before_cap_start']
+                                        time_from_cap_start = time_first_frame_arrived - self.timing_info['time_before_cap_start']
+                                        logging.info(f"dcam.cap_start() duration: {cap_start_duration*1000:.2f}ms")
+                                        logging.info(f"Time from cap_start call to first frame arrival: {time_from_cap_start*1000:.2f}ms")
+                                    
+                                    # Log total time from button press
                                     if 'trigger_sent_time' in self.timing_info:
-                                        total_delay = self.first_frame_timestamp - self.timing_info['trigger_sent_time']
+                                        total_delay = time_first_frame_arrived - self.timing_info['trigger_sent_time']
                                         logging.info(f"Total time from button press to first frame: {total_delay*1000:.2f}ms")
                             
                             # Lazy buffer allocation on first frame
@@ -779,16 +863,17 @@ class SaveThread(threading.Thread):
                 primary_hdu.header['BTNPISO'] = (datetime.fromtimestamp(self.timing_info['button_press_time'], tz=timezone.utc).isoformat(), 
                                                   'ISO time when Start button pressed (UTC)')
             
-            if 'trigger_sent_time' in self.timing_info:
-                primary_hdu.header['TRIGSENT'] = (self.timing_info['trigger_sent_time'], 'Unix time when dcam.cap_start() called (s)')
-                primary_hdu.header['TRIGISO'] = (datetime.fromtimestamp(self.timing_info['trigger_sent_time'], tz=timezone.utc).isoformat(),
-                                                  'ISO time when dcam.cap_start() called')
+            # Time immediately before dcam.cap_start() call
+            if 'time_before_cap_start' in self.timing_info:
+                primary_hdu.header['T_BFCAPS'] = (self.timing_info['time_before_cap_start'], 'Unix time before dcam.cap_start() (s)')
+                primary_hdu.header['BFCAPISO'] = (datetime.fromtimestamp(self.timing_info['time_before_cap_start'], tz=timezone.utc).isoformat(),
+                                                   'ISO time before dcam.cap_start() (UTC)')
             
-            # Add capture ready time (when camera actually ready for triggers)
-            if 'capture_ready_time' in self.timing_info:
-                primary_hdu.header['CAPREADY'] = (self.timing_info['capture_ready_time'], 'Unix time when capture ready (s)')
-                primary_hdu.header['CAPRDYIS'] = (datetime.fromtimestamp(self.timing_info['capture_ready_time'], tz=timezone.utc).isoformat(),
-                                                   'ISO time when capture ready (UTC)')
+            # Time immediately after dcam.cap_start() returns
+            if 'time_after_cap_start' in self.timing_info:
+                primary_hdu.header['T_AFCAPS'] = (self.timing_info['time_after_cap_start'], 'Unix time after dcam.cap_start() (s)')
+                primary_hdu.header['AFCAPISO'] = (datetime.fromtimestamp(self.timing_info['time_after_cap_start'], tz=timezone.utc).isoformat(),
+                                                   'ISO time after dcam.cap_start() (UTC)')
             
             # Add expected PPS time (for external triggers)
             if 'expected_pps_time' in self.timing_info:
@@ -796,20 +881,30 @@ class SaveThread(threading.Thread):
                 primary_hdu.header['EXPPISIS'] = (datetime.fromtimestamp(self.timing_info['expected_pps_time'], tz=timezone.utc).isoformat(),
                                                    'Expected PPS time (UTC)')
             
-            # Add first frame timing
+            # Time when first frame arrived at SaveThread
+            if 'time_first_frame_arrived' in self.timing_info:
+                primary_hdu.header['T_FRAME1'] = (self.timing_info['time_first_frame_arrived'], 'Unix time when first frame arrived (s)')
+                primary_hdu.header['FR1ISO'] = (datetime.fromtimestamp(self.timing_info['time_first_frame_arrived'], tz=timezone.utc).isoformat(),
+                                                 'ISO time when first frame arrived (UTC)')
+            
+            # Camera-relative timestamp of first frame
             if 'first_frame_timestamp' in self.timing_info:
-                primary_hdu.header['FRAME1'] = (self.timing_info['first_frame_timestamp'], 'First frame timestamp (Unix s)')
-                primary_hdu.header['FRAME1IS'] = (datetime.fromtimestamp(self.timing_info['first_frame_timestamp'], tz=timezone.utc).isoformat(),
-                                                    'First frame timestamp (UTC)')
-                
-                # Time from capture ready to first frame
-                if 'capture_ready_time' in self.timing_info:
-                    ready_to_frame = self.timing_info['first_frame_timestamp'] - self.timing_info['capture_ready_time']
-                    primary_hdu.header['RDY2FR'] = (ready_to_frame, 'Capture ready to first frame (s)')
-                
-                # PPS timing offset (actual vs expected)
-                if 'pps_timing_offset' in self.timing_info:
-                    primary_hdu.header['PPSOFF'] = (self.timing_info['pps_timing_offset'], 'First frame - expected PPS (s)')
+                primary_hdu.header['CAMTS1'] = (self.timing_info['first_frame_timestamp'], 'First frame camera timestamp (s)')
+                primary_hdu.header['COMMENT'] = 'CAMTS1 is camera-relative time, NOT Unix time'
+                primary_hdu.header['COMMENT'] = 'Camera timestamps are seconds since camera started'
+            
+            # Exposure and readout times
+            if 'exposure_time' in self.timing_info:
+                primary_hdu.header['EXPTIME'] = (self.timing_info['exposure_time'], 'Exposure time (s)')
+            if 'readout_time' in self.timing_info:
+                primary_hdu.header['READTIME'] = (self.timing_info['readout_time'], 'Readout time (s)')
+            
+            # Estimated trigger arrival (frame arrival - exposure - readout)
+            if 'estimated_trigger_arrival' in self.timing_info:
+                primary_hdu.header['T_TRIG'] = (self.timing_info['estimated_trigger_arrival'], 'Estimated trigger arrival time (Unix s)')
+                primary_hdu.header['TRIGISO'] = (datetime.fromtimestamp(self.timing_info['estimated_trigger_arrival'], tz=timezone.utc).isoformat(),
+                                                  'Estimated trigger arrival (ISO UTC)')
+                primary_hdu.header['COMMENT'] = 'T_TRIG = T_FRAME1 - EXPTIME - READTIME'
             
             # Store trigger source mode
             if 'trigger_source' in self.timing_info:
@@ -997,21 +1092,21 @@ class SimpleConfigManager:
                 config = json.load(f)
             
             # Apply settings
-            gui_instance.exposure_time_var.set(config.get("exposure_time_ms", 100))
+            gui_instance.exposure_time_var.set(config.get("exposure_time_ms", 1000))  # 1 second default
             gui_instance.binning_var.set(config.get("binning", "1x1"))
             gui_instance.bit_depth_var.set(config.get("bit_depth", "16-bit"))
             gui_instance.readout_speed_var.set(config.get("readout_speed", "Ultra Quiet Mode"))
             gui_instance.sensor_mode_var.set(config.get("sensor_mode", "Standard"))
             gui_instance.subarray_mode_var.set(config.get("subarray_mode", "Off"))
-            gui_instance.trigger_source_var.set(config.get("trigger_source", "Internal"))
-            gui_instance.trigger_mode_var.set(config.get("trigger_mode", "Normal"))
-            gui_instance.defect_correct_var.set(config.get("defect_correct", "ON"))
-            gui_instance.hot_pixel_level_var.set(config.get("hot_pixel_level", "STANDARD"))
+            gui_instance.trigger_source_var.set(config.get("trigger_source", "External"))  # External default
+            gui_instance.trigger_mode_var.set(config.get("trigger_mode", "Start"))
+            gui_instance.defect_correct_var.set(config.get("defect_correct", "OFF"))  # OFF default
+            gui_instance.hot_pixel_level_var.set(config.get("hot_pixel_level", "MINIMUM"))  # MINIMUM default
             
             gui_instance.save_data_var.set(config.get("save_data", False))
             gui_instance.object_name_entry.delete(0, tk.END)
             gui_instance.object_name_entry.insert(0, config.get("object_name", ""))
-            gui_instance.output_path_var.set(config.get("output_path", os.getcwd()))
+            gui_instance.output_path_var.set(config.get("output_path", "/data/cerberus"))  # /data/cerberus default
             gui_instance.cube_size_var.set(config.get("frames_per_datacube", 100))
             
             gui_instance.min_val.set(str(config.get("min_count", "0")))
@@ -1167,7 +1262,7 @@ class CameraGUI(tk.Tk):
             self.restore_config_button.config(state='disabled', text='No Previous Settings')
 
         Label(camera_controls_frame, text="Exposure Time (ms):").grid(row=1, column=0)
-        self.exposure_time_var = tk.DoubleVar(value=100)
+        self.exposure_time_var = tk.DoubleVar(value=1000)  # 1000ms = 1 second
         self.exposure_time_var.trace_add("write", self.update_exposure_time)
         self.exposure_time_entry = Entry(camera_controls_frame, textvariable=self.exposure_time_var)
         self.exposure_time_entry.grid(row=1, column=1)
@@ -1192,7 +1287,7 @@ class CameraGUI(tk.Tk):
         Label(camera_controls_frame, text="Output Directory:").grid(row=5, column=0)
         output_path_frame = Frame(camera_controls_frame)
         output_path_frame.grid(row=5, column=1, sticky='ew')
-        self.output_path_var = tk.StringVar(value=os.getcwd())
+        self.output_path_var = tk.StringVar(value="/data/cerberus")
         self.output_path_entry = Entry(output_path_frame, textvariable=self.output_path_var, width=20)
         self.output_path_entry.pack(side='left', fill='x', expand=True)
         self.browse_button = Button(output_path_frame, text="Browse...", command=self.browse_output_path)
@@ -1235,14 +1330,14 @@ class CameraGUI(tk.Tk):
         self.sensor_mode_menu.grid(row=3, column=1)
 
         Label(camera_settings_frame, text="Trigger Source:").grid(row=4, column=0)
-        self.trigger_source_var = StringVar(value="Internal")
+        self.trigger_source_var = StringVar(value="External")
         self.trigger_source_menu = OptionMenu(camera_settings_frame, self.trigger_source_var,
                                               "Internal", "External", "Software",
                                               command=self.change_trigger_source)
         self.trigger_source_menu.grid(row=4, column=1)
 
         Label(camera_settings_frame, text="Trigger Mode:").grid(row=5, column=0)
-        self.trigger_mode_var = StringVar(value="Normal")
+        self.trigger_mode_var = StringVar(value="Start")
         self.trigger_mode_menu = OptionMenu(camera_settings_frame, self.trigger_mode_var,
                                             "Normal", "Start",
                                             command=self.change_trigger_mode)
@@ -1250,14 +1345,14 @@ class CameraGUI(tk.Tk):
         
         # Defect correction controls
         Label(camera_settings_frame, text="Defect Correction:").grid(row=6, column=0)
-        self.defect_correct_var = StringVar(value="ON")
+        self.defect_correct_var = StringVar(value="OFF")
         self.defect_correct_menu = OptionMenu(camera_settings_frame, self.defect_correct_var,
                                               "OFF", "ON",
                                               command=self.change_defect_correct)
         self.defect_correct_menu.grid(row=6, column=1)
         
         Label(camera_settings_frame, text="Hot Pixel Level:").grid(row=7, column=0)
-        self.hot_pixel_level_var = StringVar(value="STANDARD")
+        self.hot_pixel_level_var = StringVar(value="MINIMUM")
         self.hot_pixel_level_menu = OptionMenu(camera_settings_frame, self.hot_pixel_level_var,
                                                "STANDARD", "MINIMUM", "AGGRESSIVE",
                                                command=self.change_hot_pixel_level)
@@ -1639,7 +1734,7 @@ class CameraGUI(tk.Tk):
             return
         
         defect_mode_value = {"OFF": 1.0, "ON": 2.0}[selected_mode]
-        self.camera_thread.set_property('DEFECT_CORRECT_MODE', defect_mode_value)
+        self.camera_thread.set_property('DEFECTCORRECT_MODE', defect_mode_value)
         self.update_status(f"Defect correction: {selected_mode}", "green")
     
     def change_hot_pixel_level(self, selected_level):
@@ -1649,7 +1744,7 @@ class CameraGUI(tk.Tk):
             return
         
         level_value = {"STANDARD": 1.0, "MINIMUM": 2.0, "AGGRESSIVE": 3.0}[selected_level]
-        self.camera_thread.set_property('HOT_PIXEL_CORRECT_LEVEL', level_value)
+        self.camera_thread.set_property('HOTPIXELCORRECT_LEVEL', level_value)
         self.update_status(f"Hot pixel level: {selected_level}", "green")
 
     def change_output_trigger_kind(self, selected_kind):
@@ -1748,7 +1843,8 @@ class CameraGUI(tk.Tk):
                 timing_info = {
                     'button_press_time': button_press_time,
                     'trigger_sent_time': trigger_sent_time,
-                    'trigger_source': self.trigger_source_var.get()
+                    'trigger_source': self.trigger_source_var.get(),
+                    'exposure_time': self.exposure_time_var.get() / 1000.0  # Convert ms to seconds
                 }
                     
                 self.save_thread = SaveThread(save_queue, self.camera_thread, object_name,
