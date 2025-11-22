@@ -875,13 +875,21 @@ class SaveThread(threading.Thread):
             if 'time_before_cap_start' in self.timing_info:
                 primary_hdu.header['T_BFCAPS'] = (self.timing_info['time_before_cap_start'], 'Unix time before dcam.cap_start() (s)')
                 primary_hdu.header['BFCAPISO'] = (datetime.fromtimestamp(self.timing_info['time_before_cap_start'], tz=timezone.utc).isoformat(),
-                                                   'ISO time before dcam.cap_start() (UTC)')
-            
+                                                'ISO time before dcam.cap_start() (UTC)')
+                primary_hdu.header['CPCMDSTA'] = (self.timing_info['time_before_cap_start'], 'Capture command start time (Unix s)')
+
             # Time immediately after dcam.cap_start() returns
             if 'time_after_cap_start' in self.timing_info:
                 primary_hdu.header['T_AFCAPS'] = (self.timing_info['time_after_cap_start'], 'Unix time after dcam.cap_start() (s)')
                 primary_hdu.header['AFCAPISO'] = (datetime.fromtimestamp(self.timing_info['time_after_cap_start'], tz=timezone.utc).isoformat(),
-                                                   'ISO time after dcam.cap_start() (UTC)')
+                                                'ISO time after dcam.cap_start() (UTC)')
+                primary_hdu.header['CPCMDFIN'] = (self.timing_info['time_after_cap_start'], 'Capture command finish time (Unix s)')
+                
+                # Calculate integer second start (next integer second after cap_start finished)
+                intsecst = int(self.timing_info['time_after_cap_start']) + 1
+                primary_hdu.header['INTSECST'] = (intsecst, 'Integer second start time (Unix s)')
+                primary_hdu.header['INTSECSO'] = (datetime.fromtimestamp(intsecst, tz=timezone.utc).isoformat(),
+                                                'Integer second start (ISO UTC)')
             
             # Time when first frame arrived at SaveThread
             if 'time_first_frame_arrived' in self.timing_info:
