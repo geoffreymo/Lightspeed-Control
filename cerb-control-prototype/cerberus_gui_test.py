@@ -287,13 +287,13 @@ class CameraThread(threading.Thread):
                 return False
             
             # Allocate buffer
-            logging.info(f"Allocating buffer for {self.buffer_size} frames...")
+            logging.info(f"Allocating camera ring buffer for {self.buffer_size} frames (~{self.buffer_size * 18.9:.1f} MB in RAM)...")
             buf_alloc_start = time.time()
             if not self.dcam.buf_alloc(self.buffer_size):
                 logging.error("Buffer allocation failed")
                 return False
             buf_alloc_time = time.time() - buf_alloc_start
-            logging.info(f"Buffer allocation took {buf_alloc_time*1000:.2f}ms ({self.buffer_size} frames)")
+            logging.info(f"Camera ring buffer allocated in {buf_alloc_time*1000:.2f}ms")
 
             # Initialize capture state
             self.capturing = True
@@ -611,7 +611,9 @@ class SaveThread(threading.Thread):
         
     def preallocate_buffers(self, frame_shape, frame_dtype):
         """Preallocate buffers based on frame size"""
-        logging.info(f"Preallocating buffers for {self.batch_size} frames of shape {frame_shape}")
+        frame_size_mb = (frame_shape[0] * frame_shape[1] * np.dtype(frame_dtype).itemsize) / (1024**2)
+        total_size_mb = frame_size_mb * self.batch_size
+        logging.info(f"Allocating save buffer for {self.batch_size} frames ({total_size_mb:.0f} MB in RAM for FITS cube batching)")
         self.frame_buffer = np.empty((self.batch_size, *frame_shape), dtype=frame_dtype)
         self.timestamp_buffer = np.empty(self.batch_size, dtype=np.float64)
         self.framestamp_buffer = np.empty(self.batch_size, dtype=np.int64)
