@@ -954,7 +954,6 @@ class SimpleConfigManager:
                 "subarray_mode": gui_instance.subarray_mode_var.get(),
                 "trigger_source": gui_instance.trigger_source_var.get(),
                 "trigger_mode": gui_instance.trigger_mode_var.get(),
-                "sync_to_second": gui_instance.sync_to_second_var.get(),
                 "save_data": gui_instance.save_data_var.get(),
                 "object_name": gui_instance.object_name_entry.get(),
                 "output_path": gui_instance.output_path_var.get(),
@@ -996,7 +995,6 @@ class SimpleConfigManager:
             gui_instance.subarray_mode_var.set(config.get("subarray_mode", "Off"))
             gui_instance.trigger_source_var.set(config.get("trigger_source", "Internal"))
             gui_instance.trigger_mode_var.set(config.get("trigger_mode", "Normal"))
-            gui_instance.sync_to_second_var.set(config.get("sync_to_second", True))
             
             gui_instance.save_data_var.set(config.get("save_data", False))
             gui_instance.object_name_entry.delete(0, tk.END)
@@ -1237,22 +1235,6 @@ class CameraGUI(tk.Tk):
                                             "Normal", "Start",
                                             command=self.change_trigger_mode)
         self.trigger_mode_menu.grid(row=5, column=1)
-
-        # Timing synchronization for external trigger
-        timing_frame = LabelFrame(camera_settings_frame, text="Timing Sync", padx=5, pady=2)
-        timing_frame.grid(row=6, column=0, columnspan=2, sticky='ew', pady=(10, 0))
-        
-        self.sync_to_second_var = tk.BooleanVar(value=True)
-        self.sync_to_second_checkbox = Checkbutton(
-            timing_frame, 
-            text="Sync start to next integer second\n(for external PPS trigger)",
-            variable=self.sync_to_second_var,
-            justify=tk.LEFT
-        )
-        self.sync_to_second_checkbox.pack(anchor='w')
-        
-        self.sync_status_label = tk.Label(timing_frame, text="", font=("Courier", 9), fg="blue")
-        self.sync_status_label.pack(anchor='w')
 
     def setup_subarray_controls(self):
         """Set up subarray control widgets"""
