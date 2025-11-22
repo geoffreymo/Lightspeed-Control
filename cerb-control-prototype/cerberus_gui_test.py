@@ -287,9 +287,13 @@ class CameraThread(threading.Thread):
                 return False
             
             # Allocate buffer
+            logging.info(f"Allocating buffer for {self.buffer_size} frames...")
+            buf_alloc_start = time.time()
             if not self.dcam.buf_alloc(self.buffer_size):
                 logging.error("Buffer allocation failed")
                 return False
+            buf_alloc_time = time.time() - buf_alloc_start
+            logging.info(f"Buffer allocation took {buf_alloc_time*1000:.2f}ms ({self.buffer_size} frames)")
 
             # Initialize capture state
             self.capturing = True
@@ -326,15 +330,14 @@ class CameraThread(threading.Thread):
             self.time_before_cap_start = time_before_cap_start
             self.time_after_cap_start = time_after_cap_start
             
-            logging.info(f"dcam.cap_start() took {(time_after_cap_start - time_before_cap_start)*1000:.2f}ms")
-            logging.info("Capture started successfully")
+            cap_start_duration = time_after_cap_start - time_before_cap_start
+            logging.info(f"Capture started successfully (dcam.cap_start took {cap_start_duration*1000:.2f}ms)")
             
-            # Calculate expected PPS time if using external trigger
+            # Calculate expected PPS time if using external trigger (store but don't log)
             if hasattr(self, 'trigger_source') and self.trigger_source == "External":
                 # First integer second AFTER cap_start completed
                 expected_pps_time = int(time_after_cap_start) + 1
                 self.expected_pps_time = expected_pps_time
-                logging.info(f"Expecting first PPS at {expected_pps_time:.6f} ({datetime.fromtimestamp(expected_pps_time, tz=timezone.utc).isoformat()})")
             
             return True
             
@@ -681,7 +684,7 @@ class SaveThread(threading.Thread):
                                     except:
                                         pass
                                 
-                                # Calculate estimated trigger arrival time
+                                # Calculate estimated trigger arrival time (store but don't log)
                                 if 'exposure_time' in self.timing_info and readout_time is not None:
                                     # Frame arrived at T_FRAME1
                                     # Trigger arrived at: T_FRAME1 - exposure_time - readout_time
@@ -691,37 +694,29 @@ class SaveThread(threading.Thread):
                                 
                                 if not self.first_frame_logged:
                                     self.first_frame_logged = True
-                                    logging.info(f"First frame arrived at system time {time_first_frame_arrived:.6f} ({datetime.fromtimestamp(time_first_frame_arrived, tz=timezone.utc).isoformat()})")
-                                    logging.info(f"First frame camera timestamp: {timestamp:.6f}s (camera-relative)")
+                                    logging.info(f"First frame arrived: system time {time_first_frame_arrived:.6f}, camera time {timestamp:.6f}s")
                                     
-                                    # Log exposure and readout times
-                                    if 'exposure_time' in self.timing_info:
-                                        logging.info(f"Exposure time: {self.timing_info['exposure_time']*1000:.3f}ms")
-                                    if 'readout_time' in self.timing_info:
-                                        logging.info(f"Readout time: {self.timing_info['readout_time']*1000:.3f}ms")
-                                    
-                                    # Log estimated trigger arrival
-                                    if 'estimated_trigger_arrival' in self.timing_info:
-                                        est_trigger = self.timing_info['estimated_trigger_arrival']
-                                        logging.info(f"Estimated trigger arrival: {est_trigger:.6f} ({datetime.fromtimestamp(est_trigger, tz=timezone.utc).isoformat()})")
-                                        
-                                        # Compare to expected PPS
-                                        if 'expected_pps_time' in self.timing_info:
-                                            expected = self.timing_info['expected_pps_time']
-                                            offset = est_trigger - expected
-                                            logging.info(f"Trigger offset from expected PPS: {offset*1000:.2f}ms")
-                                    
-                                    # Log delays
-                                    if 'time_before_cap_start' in self.timing_info and 'time_after_cap_start' in self.timing_info:
-                                        cap_start_duration = self.timing_info['time_after_cap_start'] - self.timing_info['time_before_cap_start']
-                                        time_from_cap_start = time_first_frame_arrived - self.timing_info['time_before_cap_start']
-                                        logging.info(f"dcam.cap_start() duration: {cap_start_duration*1000:.2f}ms")
-                                        logging.info(f"Time from cap_start call to first frame arrival: {time_from_cap_start*1000:.2f}ms")
-                                    
-                                    # Log total time from button press
+                                    # Calculate timing breakdown
                                     if 'trigger_sent_time' in self.timing_info:
                                         total_delay = time_first_frame_arrived - self.timing_info['trigger_sent_time']
-                                        logging.info(f"Total time from button press to first frame: {total_delay*1000:.2f}ms")
+                                        logging.info(f"Total time from button press to first frame: {total_delay:.3f}s")
+                                        
+                                        # Show breakdown of where time was spent
+                                        if 'time_before_cap_start' in self.timing_info and 'time_after_cap_start' in self.timing_info:
+                                            buf_alloc_time = self.timing_info['time_before_cap_start'] - self.timing_info['trigger_sent_time']
+                                            cap_start_time = self.timing_info['time_after_cap_start'] - self.timing_info['time_before_cap_start']
+                                            wait_for_trigger = time_first_frame_arrived - self.timing_info['time_after_cap_start']
+                                            
+                                            # Subtract exposure and readout from wait time to get actual trigger wait
+                                            exposure_time = self.timing_info.get('exposure_time', 0)
+                                            readout_time = self.timing_info.get('readout_time', 0)
+                                            trigger_wait = wait_for_trigger - exposure_time - readout_time
+                                            
+                                            logging.info(f"  Breakdown: buf_alloc={buf_alloc_time*1000:.0f}ms, cap_start={cap_start_time*1000:.0f}ms, "
+                                                        f"trigger_wait={trigger_wait*1000:.0f}ms, exposure={exposure_time*1000:.0f}ms, "
+                                                        f"readout={readout_time*1000:.0f}ms "
+                                                        f"(sum={(buf_alloc_time + cap_start_time + trigger_wait + exposure_time + readout_time)*1000:.0f}ms)")
+
                             
                             # Lazy buffer allocation on first frame
                             if self.frame_buffer is None:
