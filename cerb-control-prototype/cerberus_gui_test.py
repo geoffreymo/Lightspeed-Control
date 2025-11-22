@@ -333,12 +333,6 @@ class CameraThread(threading.Thread):
             cap_start_duration = time_after_cap_start - time_before_cap_start
             logging.info(f"Capture started successfully (dcam.cap_start took {cap_start_duration*1000:.2f}ms)")
             
-            # Calculate expected PPS time if using external trigger (store but don't log)
-            if hasattr(self, 'trigger_source') and self.trigger_source == "External":
-                # First integer second AFTER cap_start completed
-                expected_pps_time = int(time_after_cap_start) + 1
-                self.expected_pps_time = expected_pps_time
-            
             return True
             
         finally:
@@ -392,8 +386,8 @@ class CameraThread(threading.Thread):
             'OUTPUT_TRIG_PERIOD_0': 10.0,  # Period in seconds
             'SENSOR_MODE': 1.0,
             'IMAGE_PIXEL_TYPE': 2.0,
-            'DEFECTCORRECT_MODE': 1.0,  # 1=OFF, 2=ON
-            'HOTPIXELCORRECT_LEVEL': 2.0  # 1=STANDARD, 2=MINIMUM, 3=AGGRESSIVE
+            'DEFECT_CORRECT_MODE': 1.0,  # 1=OFF, 2=ON
+            'HOT_PIXEL_CORRECT_LEVEL': 2.0  # 1=STANDARD, 2=MINIMUM, 3=AGGRESSIVE
         }
         for prop, value in defaults.items():
             self.set_property(prop, value)
@@ -670,8 +664,6 @@ class SaveThread(threading.Thread):
                                     self.timing_info['time_before_cap_start'] = self.camera_thread.time_before_cap_start
                                 if hasattr(self.camera_thread, 'time_after_cap_start'):
                                     self.timing_info['time_after_cap_start'] = self.camera_thread.time_after_cap_start
-                                if hasattr(self.camera_thread, 'expected_pps_time'):
-                                    self.timing_info['expected_pps_time'] = self.camera_thread.expected_pps_time
                                 
                                 # Get readout time from camera
                                 readout_time = None
@@ -869,12 +861,6 @@ class SaveThread(threading.Thread):
                 primary_hdu.header['T_AFCAPS'] = (self.timing_info['time_after_cap_start'], 'Unix time after dcam.cap_start() (s)')
                 primary_hdu.header['AFCAPISO'] = (datetime.fromtimestamp(self.timing_info['time_after_cap_start'], tz=timezone.utc).isoformat(),
                                                    'ISO time after dcam.cap_start() (UTC)')
-            
-            # Add expected PPS time (for external triggers)
-            if 'expected_pps_time' in self.timing_info:
-                primary_hdu.header['EXPPPS'] = (self.timing_info['expected_pps_time'], 'Expected PPS time (Unix s)')
-                primary_hdu.header['EXPPISIS'] = (datetime.fromtimestamp(self.timing_info['expected_pps_time'], tz=timezone.utc).isoformat(),
-                                                   'Expected PPS time (UTC)')
             
             # Time when first frame arrived at SaveThread
             if 'time_first_frame_arrived' in self.timing_info:
@@ -1729,7 +1715,7 @@ class CameraGUI(tk.Tk):
             return
         
         defect_mode_value = {"OFF": 1.0, "ON": 2.0}[selected_mode]
-        self.camera_thread.set_property('DEFECTCORRECT_MODE', defect_mode_value)
+        self.camera_thread.set_property('DEFECT_CORRECT_MODE', defect_mode_value)
         self.update_status(f"Defect correction: {selected_mode}", "green")
     
     def change_hot_pixel_level(self, selected_level):
@@ -1739,7 +1725,7 @@ class CameraGUI(tk.Tk):
             return
         
         level_value = {"STANDARD": 1.0, "MINIMUM": 2.0, "AGGRESSIVE": 3.0}[selected_level]
-        self.camera_thread.set_property('HOTPIXELCORRECT_LEVEL', level_value)
+        self.camera_thread.set_property('HOT_PIXEL_CORRECT_LEVEL', level_value)
         self.update_status(f"Hot pixel level: {selected_level}", "green")
 
     def change_output_trigger_kind(self, selected_kind):
@@ -1816,7 +1802,7 @@ class CameraGUI(tk.Tk):
             trigger_sent_time = time.time()
             logging.info(f"Button pressed at {button_press_time:.6f}, initializing camera at {trigger_sent_time:.6f}")
             
-            # Store trigger info for later (will calculate expected PPS after camera ready)
+            # Store trigger info for later
             self.camera_thread.button_press_time = button_press_time
             self.camera_thread.trigger_sent_time = trigger_sent_time
             self.camera_thread.trigger_source = self.trigger_source_var.get()
@@ -1834,7 +1820,6 @@ class CameraGUI(tk.Tk):
                     return
                 
                 # Pass basic timing information to SaveThread
-                # Expected PPS will be calculated after camera initialization completes
                 timing_info = {
                     'button_press_time': button_press_time,
                     'trigger_sent_time': trigger_sent_time,
