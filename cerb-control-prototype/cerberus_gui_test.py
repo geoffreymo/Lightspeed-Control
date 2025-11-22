@@ -133,6 +133,14 @@ class CameraThread(threading.Thread):
                 logging.info("Camera connected successfully")
                 self.set_defaults()
                 self.update_camera_params()
+
+                # Log all camera properties after defaults are applied
+                logging.info("=== ALL AVAILABLE CAMERA PROPERTIES (after set_defaults) ===")
+                with self.shared_data.lock:
+                    for prop_name in sorted(self.shared_data.camera_params.keys()):
+                        logging.info(f"  {prop_name}: {self.shared_data.camera_params[prop_name]}")
+                logging.info("=== END CAMERA PROPERTIES ===")
+
                 self.is_connected = True
                 self.update_gui_status("Camera connected", "green")
                 
@@ -385,11 +393,56 @@ class CameraThread(threading.Thread):
                     logging.error(f"cap_stop failed: {self.dcam.lasterr()}")
                 if not self.dcam.buf_release():
                     logging.error(f"buf_release failed: {self.dcam.lasterr()}")
+                
+                # Reset trigger state by toggling trigger source
+                # This ensures the camera will properly wait for external trigger on next cap_start()
+                self.reset_trigger_state()
+                
                 logging.info("Capture stopped cleanly")
             except Exception as e:
                 logging.error(f"Error stopping capture: {e}")
         
         return True
+    
+    def reset_trigger_state(self):
+        """Restore trigger state after cap_stop()"""
+        try:
+            # Check what the GUI thinks the trigger source should be
+            with self.shared_data.lock:
+                gui_trigger_text = self.shared_data.camera_params.get('TRIGGER SOURCE', 'INTERNAL')
+            
+            # Only restore if GUI expects External
+            if gui_trigger_text != 'EXTERNAL':
+                logging.debug(f"Trigger source is {gui_trigger_text}, no restore needed")
+                return
+            
+            # Get current camera state
+            current_trigger_source = self.dcam.prop_getvalue(CAMERA_PARAMS['TRIGGER_SOURCE'])
+            if current_trigger_source is False:
+                logging.warning("Could not read current trigger source")
+                return
+            
+            current_text = {1.0: 'Internal', 2.0: 'External', 3.0: 'Software'}.get(current_trigger_source, f'{current_trigger_source}')
+            logging.debug(f"Camera trigger source after stop: {current_trigger_source} ({current_text})")
+            
+            # If camera reverted to Internal but GUI expects External, restore it
+            if current_trigger_source != 2.0:
+                logging.info("Restoring trigger source to External (2.0) after cap_stop()")
+                if self.dcam.prop_setvalue(CAMERA_PARAMS['TRIGGER_SOURCE'], 2.0):
+                    # Verify restoration
+                    verify = self.dcam.prop_getvalue(CAMERA_PARAMS['TRIGGER_SOURCE'])
+                    verify_text = {1.0: 'Internal', 2.0: 'External', 3.0: 'Software'}.get(verify, f'{verify}')
+                    if verify == 2.0:
+                        logging.info(f"✅ Trigger source restored to {verify} (External) - verified")
+                    else:
+                        logging.error(f"❌ Trigger source restore failed (got {verify} ({verify_text}), expected 2.0 (External))")
+                else:
+                    logging.error(f"Failed to restore External trigger: {self.dcam.lasterr()}")
+            else:
+                logging.debug("Trigger source already 2.0 (External), no restore needed")
+                
+        except Exception as e:
+            logging.error(f"Error restoring trigger state: {e}")
 
     def set_defaults(self):
         """Set default camera parameters"""
@@ -397,16 +450,16 @@ class CameraThread(threading.Thread):
         defaults = {
             'READOUT_SPEED': 1.0,
             'EXPOSURE_TIME': 1.0,  # 1 second exposure time
-            'TRIGGER_SOURCE': 2.0,  # 2=External (1=Internal, 3=Software)
-            'TRIGGER_MODE': 6.0,    # 1=Normal, 6=Start
-            'OUTPUT_TRIG_KIND_0': 3.0,    # 1=Ready, 2=Exposure, 3=Programmable, 4=Global
-            'OUTPUT_TRIG_ACTIVE_0': 1.0,   # Enable output trigger
-            'OUTPUT_TRIG_POLARITY_0': 1.0, # 1=Positive, 2=Negative
-            'OUTPUT_TRIG_PERIOD_0': 10.0,  # Period in seconds
+            'TRIGGER_MODE': 6.0,    # 1=Normal, 6=Start - SET THIS FIRST!
+            'TRIGGER_SOURCE': 2.0,  # 2=External (now this should work)
+            'OUTPUT_TRIG_KIND_0': 3.0,
+            'OUTPUT_TRIG_ACTIVE_0': 1.0,
+            'OUTPUT_TRIG_POLARITY_0': 1.0,
+            'OUTPUT_TRIG_PERIOD_0': 10.0,
             'SENSOR_MODE': 1.0,
             'IMAGE_PIXEL_TYPE': 2.0,
-            'DEFECT_CORRECT_MODE': 1.0,  # 1=OFF, 2=ON
-            'HOT_PIXEL_CORRECT_LEVEL': 2.0  # 1=STANDARD, 2=MINIMUM, 3=AGGRESSIVE
+            'DEFECT_CORRECT_MODE': 1.0,
+            'HOT_PIXEL_CORRECT_LEVEL': 2.0
         }
         for prop, value in defaults.items():
             self.set_property(prop, value)
@@ -471,8 +524,25 @@ class CameraThread(threading.Thread):
         try:
             if self.dcam is None:
                 return False
+            
+            # SPECIAL LOGGING FOR TRIGGER SOURCE
+            if prop_name == 'TRIGGER_SOURCE':
+                before = self.dcam.prop_getvalue(CAMERA_PARAMS['TRIGGER_SOURCE'])
+                before_text = {1.0: 'Internal', 2.0: 'External', 3.0: 'Software'}.get(before, f'{before}')
+                value_text = {1.0: 'Internal', 2.0: 'External', 3.0: 'Software'}.get(value, f'{value}')
+                logging.warning(f"⚠️ TRIGGER_SOURCE change requested: {before} ({before_text}) → {value} ({value_text})")
                 
             if self.dcam.prop_setvalue(CAMERA_PARAMS[prop_name], value):
+                # VERIFY THE CHANGE
+                if prop_name == 'TRIGGER_SOURCE':
+                    after = self.dcam.prop_getvalue(CAMERA_PARAMS['TRIGGER_SOURCE'])
+                    after_text = {1.0: 'Internal', 2.0: 'External', 3.0: 'Software'}.get(after, f'{after}')
+                    if after != value:
+                        value_text = {1.0: 'Internal', 2.0: 'External', 3.0: 'Software'}.get(value, f'{value}')
+                        logging.error(f"❌ TRIGGER_SOURCE change FAILED: requested {value} ({value_text}), got {after} ({after_text})")
+                    else:
+                        logging.warning(f"✅ TRIGGER_SOURCE successfully changed to {after} ({after_text})")
+                        
                 self.update_camera_params()
                 return True
             else:
@@ -502,13 +572,9 @@ class CameraThread(threading.Thread):
                             self.shared_data.camera_params[propname] = valuetext or propvalue
                     idprop = self.dcam.prop_getnextid(idprop)
                 
-                # Log all available properties once for debugging
+                # Log all available properties once for debugging (after defaults are set)
                 if not hasattr(self, '_logged_all_props'):
                     self._logged_all_props = True
-                    logging.info("=== ALL AVAILABLE CAMERA PROPERTIES ===")
-                    for prop_name in sorted(self.shared_data.camera_params.keys()):
-                        logging.info(f"  {prop_name}: {self.shared_data.camera_params[prop_name]}")
-                    logging.info("=== END CAMERA PROPERTIES ===")
         finally:
             DCamLock.release_property()
 
@@ -867,58 +933,67 @@ class SaveThread(threading.Thread):
             
             # Add timing information from capture start
             if 'button_press_time' in self.timing_info:
-                primary_hdu.header['BTNPRESS'] = (self.timing_info['button_press_time'], 'Unix time when Start button pressed (s)')
+                primary_hdu.header['BTNPRESS'] = (self.timing_info['button_press_time'], 'Unix time (s)')
                 primary_hdu.header['BTNPISO'] = (datetime.fromtimestamp(self.timing_info['button_press_time'], tz=timezone.utc).isoformat(), 
-                                                  'ISO time when Start button pressed (UTC)')
-            
+                                                'ISO UTC')
+
             # Time immediately before dcam.cap_start() call
             if 'time_before_cap_start' in self.timing_info:
-                primary_hdu.header['T_BFCAPS'] = (self.timing_info['time_before_cap_start'], 'Unix time before dcam.cap_start() (s)')
+                primary_hdu.header['T_BFCAPS'] = (self.timing_info['time_before_cap_start'], 'Unix time (s)')
                 primary_hdu.header['BFCAPISO'] = (datetime.fromtimestamp(self.timing_info['time_before_cap_start'], tz=timezone.utc).isoformat(),
-                                                'ISO time before dcam.cap_start() (UTC)')
-                primary_hdu.header['CPCMDSTA'] = (self.timing_info['time_before_cap_start'], 'Capture command start time (Unix s)')
+                                                'ISO UTC')
+                primary_hdu.header['CPCMDSTA'] = (self.timing_info['time_before_cap_start'], 'Unix time (s)')
 
             # Time immediately after dcam.cap_start() returns
             if 'time_after_cap_start' in self.timing_info:
-                primary_hdu.header['T_AFCAPS'] = (self.timing_info['time_after_cap_start'], 'Unix time after dcam.cap_start() (s)')
+                primary_hdu.header['T_AFCAPS'] = (self.timing_info['time_after_cap_start'], 'Unix time (s)')
                 primary_hdu.header['AFCAPISO'] = (datetime.fromtimestamp(self.timing_info['time_after_cap_start'], tz=timezone.utc).isoformat(),
-                                                'ISO time after dcam.cap_start() (UTC)')
-                primary_hdu.header['CPCMDFIN'] = (self.timing_info['time_after_cap_start'], 'Capture command finish time (Unix s)')
+                                                'ISO UTC')
+                primary_hdu.header['CPCMDFIN'] = (self.timing_info['time_after_cap_start'], 'Unix time (s)')
                 
                 # Calculate integer second start (next integer second after cap_start finished)
                 intsecst = int(self.timing_info['time_after_cap_start']) + 1
-                primary_hdu.header['INTSECST'] = (intsecst, 'Integer second start time (Unix s)')
+                primary_hdu.header['INTSECST'] = (intsecst, 'Unix time (s)')
                 primary_hdu.header['INTSECSO'] = (datetime.fromtimestamp(intsecst, tz=timezone.utc).isoformat(),
-                                                'Integer second start (ISO UTC)')
-            
+                                                'ISO UTC')
+
             # Time when first frame arrived at SaveThread
             if 'time_first_frame_arrived' in self.timing_info:
-                primary_hdu.header['T_FRAME1'] = (self.timing_info['time_first_frame_arrived'], 'Unix time when first frame arrived (s)')
+                primary_hdu.header['T_FRAME1'] = (self.timing_info['time_first_frame_arrived'], 'Unix time (s)')
                 primary_hdu.header['FR1ISO'] = (datetime.fromtimestamp(self.timing_info['time_first_frame_arrived'], tz=timezone.utc).isoformat(),
-                                                 'ISO time when first frame arrived (UTC)')
-            
+                                                'ISO UTC')
+
             # Camera-relative timestamp of first frame
             if 'first_frame_timestamp' in self.timing_info:
-                primary_hdu.header['CAMTS1'] = (self.timing_info['first_frame_timestamp'], 'First frame camera timestamp (s)')
-                primary_hdu.header['COMMENT'] = 'CAMTS1 is camera-relative time, NOT Unix time'
-                primary_hdu.header['COMMENT'] = 'Camera timestamps are seconds since camera started'
-            
+                primary_hdu.header['CAMTS1'] = (self.timing_info['first_frame_timestamp'], 'Camera time (s)')
+
             # Exposure and readout times
             if 'exposure_time' in self.timing_info:
                 primary_hdu.header['EXPTIME'] = (self.timing_info['exposure_time'], 'Exposure time (s)')
             if 'readout_time' in self.timing_info:
                 primary_hdu.header['READTIME'] = (self.timing_info['readout_time'], 'Readout time (s)')
-            
+
             # Estimated trigger arrival (frame arrival - exposure - readout)
             if 'estimated_trigger_arrival' in self.timing_info:
-                primary_hdu.header['T_TRIG'] = (self.timing_info['estimated_trigger_arrival'], 'Estimated trigger arrival time (Unix s)')
+                primary_hdu.header['T_TRIG'] = (self.timing_info['estimated_trigger_arrival'], 'Unix time (s)')
                 primary_hdu.header['TRIGISO'] = (datetime.fromtimestamp(self.timing_info['estimated_trigger_arrival'], tz=timezone.utc).isoformat(),
-                                                  'Estimated trigger arrival (ISO UTC)')
-                primary_hdu.header['COMMENT'] = 'T_TRIG = T_FRAME1 - EXPTIME - READTIME'
-            
+                                                'ISO UTC')
+
             # Store trigger source mode
             if 'trigger_source' in self.timing_info:
-                primary_hdu.header['TRIGSRC'] = (self.timing_info['trigger_source'], 'Trigger source mode')
+                primary_hdu.header['TRIGSRC'] = (self.timing_info['trigger_source'], 'Trigger source')
+
+            # Add detailed explanations via COMMENT cards
+            primary_hdu.header['COMMENT'] = '=== TIMING KEYWORDS EXPLANATION ==='
+            primary_hdu.header['COMMENT'] = 'BTNPRESS/BTNPISO: When Start button was pressed'
+            primary_hdu.header['COMMENT'] = 'T_BFCAPS/BFCAPISO/CPCMDSTA: Before dcam.cap_start() call'
+            primary_hdu.header['COMMENT'] = 'T_AFCAPS/AFCAPISO/CPCMDFIN: After dcam.cap_start() returned'
+            primary_hdu.header['COMMENT'] = 'INTSECST/INTSECSO: Next integer second after cap_start'
+            primary_hdu.header['COMMENT'] = 'T_FRAME1/FR1ISO: When first frame arrived at save thread'
+            primary_hdu.header['COMMENT'] = 'CAMTS1: Camera-relative time (seconds since camera started)'
+            primary_hdu.header['COMMENT'] = 'T_TRIG/TRIGISO: Estimated trigger arrival time'
+            primary_hdu.header['COMMENT'] = 'T_TRIG = T_FRAME1 - EXPTIME - READTIME'
+            primary_hdu.header['COMMENT'] = 'All *ISO keywords are in UTC timezone'
 
             # Use data_cube directly - it's already a numpy array
             image_hdu = fits.ImageHDU(data=data_cube)
