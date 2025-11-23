@@ -321,24 +321,24 @@ class CameraThread(threading.Thread):
             except Exception as e:
                 logging.error(f"Error setting timestamp producer: {e}")
 
-            # Wait to sync dcam.cap_start() to 50ms after an integer second
+            # Calculate target time (50ms after next integer second)
             current_time = time.time()
-            time_in_second = current_time - int(current_time)  # Fractional part (0.0 to 1.0)
-            target_offset = 0.050  # 50ms after integer second
-            
-            if time_in_second < target_offset:
-                # We're before the target, wait for it in this second
-                wait_time = target_offset - time_in_second
-            else:
-                # We're past the target, wait for it in the next second
-                wait_time = (1.0 - time_in_second) + target_offset
-            
-            logging.info(f"Syncing: waiting {wait_time*1000:.1f}ms to align dcam.cap_start() to 50ms after integer second")
-            time.sleep(wait_time)
-            
-            # Record time immediately before starting camera
+            next_integer_second = int(current_time) + 1
+            target_cap_start_time = next_integer_second + 0.10  # 100ms after integer second
+
+            # Wait until just before target time
+            wait_time = target_cap_start_time - time.time()
+            if wait_time > 0:
+                logging.info(f"Syncing: waiting {wait_time*1000:.1f}ms to align dcam.cap_start() to 100ms after integer second")
+                logging.info(f"  Current time: {current_time:.6f}")
+                logging.info(f"  Target time:  {target_cap_start_time:.6f}")
+                time.sleep(wait_time)
+
+            # Record time immediately before starting camera (should be very close to target_cap_start_time)
             time_before_cap_start = time.time()
-            
+            logging.info(f"  Actual time after sleep: {time_before_cap_start:.6f} (target was {target_cap_start_time:.6f})")
+            logging.info(f"  Sleep accuracy: {(time_before_cap_start - target_cap_start_time)*1000:.1f}ms off target")
+
             # Start capture
             if not self.dcam.cap_start():
                 logging.error("Failed to start capture")
