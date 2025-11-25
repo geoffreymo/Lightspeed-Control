@@ -84,7 +84,7 @@ class CameraThread(threading.Thread):
         self.capturing = False
         self.stop_requested = threading.Event()
         self.frame_index = 0
-        self.buffer_size = 1000  # Increased for high frame rates (0.5s at 2000 fps)
+        self.buffer_size = 100  # Increase this for high frame rates
         self.save_queue = None
         self.is_connected = False
         self.cleanup_done = False  # Flag to prevent double cleanup
