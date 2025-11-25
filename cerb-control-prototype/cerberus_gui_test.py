@@ -452,9 +452,10 @@ class CameraThread(threading.Thread):
             'EXPOSURE_TIME': 1.0,  # 1 second exposure time
             'TRIGGER_MODE': 6.0,    # 1=Normal, 6=Start - SET THIS FIRST!
             'TRIGGER_SOURCE': 2.0,  # 2=External (now this should work)
+            'TRIGGER_POLARITY': 2.0,  # 2=Positive (rising edge) for input trigger
             'OUTPUT_TRIG_KIND_0': 3.0,
             'OUTPUT_TRIG_ACTIVE_0': 1.0,
-            'OUTPUT_TRIG_POLARITY_0': 1.0,
+            'OUTPUT_TRIG_POLARITY_0': 2.0,  # 2=Positive (rising edge) for output trigger
             'OUTPUT_TRIG_PERIOD_0': 10.0,
             'SENSOR_MODE': 1.0,
             'IMAGE_PIXEL_TYPE': 2.0,
